@@ -1,0 +1,1 @@
+curl -sS "https://api.github.com/orgs/$1/repos?per_page=100&sort=updated" -H 'Accept: application/vnd.github.v3+json' | python3 -c "import sys,json;data=json.load(sys.stdin);print('\n'.join(f'{r[\"name\"]}' for r in data))" | xargs -n 1 sh $(dirname $0)/pull.sh $1
