@@ -1,5 +1,5 @@
 set -eux
-for i in $(seq 1 20); do
+for i in $(seq 1 10); do
 sh $(dirname $0)/updateallcargo.sh
 sh $(dirname $0)/pushall.sh
 done
