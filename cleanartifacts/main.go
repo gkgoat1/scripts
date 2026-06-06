@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/gkgoat1/scripts/workspace"
 )
@@ -33,29 +34,49 @@ func main() {
 	}
 }
 
+// removePaths deletes all paths concurrently and returns the first error encountered.
+func removePaths(paths []string) error {
+	errc := make(chan error, len(paths))
+	var wg sync.WaitGroup
+	for _, p := range paths {
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			fmt.Println(p)
+			if err := os.RemoveAll(p); err != nil {
+				errc <- err
+			}
+		}(p)
+	}
+	wg.Wait()
+	close(errc)
+	return <-errc
+}
+
 func cleanRepoRoots(root string) error {
 	snap, err := workspace.NewOSScanner(root).Scan(context.Background())
 	if err != nil {
 		return fmt.Errorf("scan: %w", err)
 	}
+	var paths []string
 	for _, proj := range snap.Projects {
 		for _, repo := range proj.Repos {
 			for _, name := range artifacts {
 				path := filepath.Join(repo.Path, name)
 				if _, err := os.Stat(path); err == nil {
-					fmt.Println(path)
-					if err := os.RemoveAll(path); err != nil {
-						return err
-					}
+					paths = append(paths, path)
 				}
 			}
 		}
 	}
-	return nil
+	return removePaths(paths)
 }
 
 func cleanAll(root string) error {
-	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	// Collect matching paths first so the walk's SkipDir logic is unaffected,
+	// then delete all of them concurrently.
+	var paths []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -64,13 +85,14 @@ func cleanAll(root string) error {
 		}
 		for _, name := range artifacts {
 			if d.Name() == name {
-				fmt.Println(path)
-				if err := os.RemoveAll(path); err != nil {
-					return err
-				}
+				paths = append(paths, path)
 				return filepath.SkipDir
 			}
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	return removePaths(paths)
 }
