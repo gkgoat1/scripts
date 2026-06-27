@@ -108,8 +108,14 @@ func main() {
 	// remote may therefore be operated on more than once; that is correct;
 	// the second pass propagates any commits the first pass delivered to it.
 	failed := 0
+	results := make(chan bool, len(repos))
 	for _, r := range repos {
-		if !operate(r, o, map[string]bool{}) {
+		go func(r string) {
+			results <- operate(r, o, map[string]bool{})
+		}(r)
+	}
+	for range repos {
+		if !<-results {
 			failed++
 		}
 	}
@@ -122,6 +128,10 @@ func main() {
 // stack holds the repositories on the current recursion path (resolved through
 // symlinks) to break cycles. It returns false if any git operation for this
 // repository (or a descendant recursion) failed.
+//
+// Local remotes are processed concurrently; dependency order is still honored
+// because each repository waits for its local-remote children (pull) or
+// finishes before them (push).
 func operate(repo string, o opts, stack map[string]bool) bool {
 	rp, err := filepath.EvalSymlinks(repo)
 	if err != nil {
@@ -130,8 +140,6 @@ func operate(repo string, o opts, stack map[string]bool) bool {
 	if stack[rp] {
 		return true // cycle: already on this recursion path
 	}
-	stack[rp] = true
-	defer delete(stack, rp)
 
 	remotes, err := o.remotes(repo)
 	if err != nil {
@@ -146,65 +154,62 @@ func operate(repo string, o opts, stack map[string]bool) bool {
 		return false
 	}
 
+	childStack := copyStack(stack)
+	childStack[rp] = true
+
 	if o.action == "push" {
-		return doPush(repo, clean, remotes, local, o, stack)
+		ok := pushRepo(repo, clean, remotes, o)
+		if !operateAll(repo, local, o, childStack) {
+			ok = false
+		}
+		return ok
 	}
-	return doPull(repo, clean, remotes, local, o, stack)
+	ok := operateAll(repo, local, o, childStack)
+	if !pullRepo(repo, clean, remotes, o) {
+		ok = false
+	}
+	return ok
 }
 
-// doPush pushes the current repository to all remotes (when clean), then
-// recurses into local remotes.
-func doPush(repo string, clean bool, remotes, local []string, o opts, stack map[string]bool) bool {
-	ok := true
+// pushRepo pushes the current repository to all remotes when it is clean.
+func pushRepo(repo string, clean bool, remotes []string, o opts) bool {
 	if !clean {
 		fmt.Printf("[skip] %s: uncommitted changes\n", repo)
-	} else {
-		for _, r := range remotes {
-			if url, err := remoteURL(repo, r); err == nil {
-				if lr, lok := resolveLocalRemote(repo, url); lok {
-					o.ensurePushable(lr)
-				}
-			}
-			fmt.Printf("[push] %s -> %s\n", repo, r)
-			if err := o.git(repo, "push", r); err != nil {
-				fmt.Fprintf(os.Stderr, "[error] %s: push %s: %v\n", repo, r, err)
-				ok = false
-			}
-			if o.all {
-				if err := o.git(repo, "push", r, "--all"); err != nil {
-					fmt.Fprintf(os.Stderr, "[error] %s: push --all %s: %v\n", repo, r, err)
-					ok = false
-				}
-				if err := o.git(repo, "push", r, "--tags"); err != nil {
-					fmt.Fprintf(os.Stderr, "[error] %s: push --tags %s: %v\n", repo, r, err)
-					ok = false
-				}
+		return true
+	}
+	ok := true
+	for _, r := range remotes {
+		if url, err := remoteURL(repo, r); err == nil {
+			if lr, lok := resolveLocalRemote(repo, url); lok {
+				o.ensurePushable(lr)
 			}
 		}
-	}
-	for _, lr := range local {
-		fmt.Printf("[recurse] %s -> %s\n", repo, lr)
-		if !operate(lr, o, stack) {
+		fmt.Printf("[push] %s -> %s\n", repo, r)
+		if err := o.git(repo, "push", r); err != nil {
+			fmt.Fprintf(os.Stderr, "[error] %s: push %s: %v\n", repo, r, err)
 			ok = false
+		}
+		if o.all {
+			if err := o.git(repo, "push", r, "--all"); err != nil {
+				fmt.Fprintf(os.Stderr, "[error] %s: push --all %s: %v\n", repo, r, err)
+				ok = false
+			}
+			if err := o.git(repo, "push", r, "--tags"); err != nil {
+				fmt.Fprintf(os.Stderr, "[error] %s: push --tags %s: %v\n", repo, r, err)
+				ok = false
+			}
 		}
 	}
 	return ok
 }
 
-// doPull recurses into local remotes first, then pulls the current repository
-// from all remotes (when clean).
-func doPull(repo string, clean bool, remotes, local []string, o opts, stack map[string]bool) bool {
-	ok := true
-	for _, lr := range local {
-		fmt.Printf("[recurse] %s -> %s\n", repo, lr)
-		if !operate(lr, o, stack) {
-			ok = false
-		}
-	}
+// pullRepo pulls the current repository from all remotes when it is clean.
+func pullRepo(repo string, clean bool, remotes []string, o opts) bool {
 	if !clean {
 		fmt.Printf("[skip] %s: uncommitted changes\n", repo)
-		return ok
+		return true
 	}
+	ok := true
 	for _, r := range remotes {
 		fmt.Printf("[pull] %s <- %s\n", repo, r)
 		args := []string{"pull"}
@@ -218,6 +223,38 @@ func doPull(repo string, clean bool, remotes, local []string, o opts, stack map[
 		}
 	}
 	return ok
+}
+
+// operateAll runs operate on each repository concurrently and returns true
+// only if every operation succeeded. parent is used only for logging the
+// dependency edge.
+func operateAll(parent string, repos []string, o opts, stack map[string]bool) bool {
+	if len(repos) == 0 {
+		return true
+	}
+	results := make(chan bool, len(repos))
+	for _, r := range repos {
+		fmt.Printf("[recurse] %s -> %s\n", parent, r)
+		go func(r string) {
+			results <- operate(r, o, stack)
+		}(r)
+	}
+	ok := true
+	for range repos {
+		if !<-results {
+			ok = false
+		}
+	}
+	return ok
+}
+
+// copyStack returns a shallow copy of stack for use by child goroutines.
+func copyStack(stack map[string]bool) map[string]bool {
+	c := make(map[string]bool, len(stack)+1)
+	for k, v := range stack {
+		c[k] = v
+	}
+	return c
 }
 
 // localRemotes returns the resolved filesystem paths of remotes that point to a
