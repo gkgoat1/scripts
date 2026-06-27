@@ -161,6 +161,38 @@ func TestDryRun(t *testing.T) {
 	}
 }
 
+func TestCommitMessage(t *testing.T) {
+	work, mirror, upstream := buildChain(t)
+
+	// Leave uncommitted changes and push with a commit message.
+	mustWrite(t, filepath.Join(work, "f.txt"), "committed-by-gitall\n")
+	workHeadBefore := readHead(t, work)
+
+	if code := run([]string{"-m", "wip", "push", work}); code != 0 {
+		t.Fatalf("gitall -m push exit %d", code)
+	}
+
+	workHeadAfter := readHead(t, work)
+	if workHeadAfter == workHeadBefore {
+		t.Errorf("work HEAD did not advance after commit")
+	}
+	if got := readHead(t, mirror); got != workHeadAfter {
+		t.Errorf("mirror HEAD = %s, want %s", got, workHeadAfter)
+	}
+	if got := readHead(t, upstream); got != workHeadAfter {
+		t.Errorf("upstream HEAD = %s, want %s", got, workHeadAfter)
+	}
+
+	// Verify the commit message was used.
+	out, err := exec.Command("git", "-C", work, "log", "-1", "--pretty=%B").Output()
+	if err != nil {
+		t.Fatalf("git log in work: %v", err)
+	}
+	if !strings.Contains(string(out), "wip") {
+		t.Errorf("commit message did not contain 'wip': %s", out)
+	}
+}
+
 // run invokes main with the given args and returns the exit code.
 func run(args []string) int {
 	// main() calls os.Exit; run it in a goroutine by calling an extracted

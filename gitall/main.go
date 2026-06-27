@@ -8,7 +8,8 @@
 //   - -from prtag: directories containing a .prtag marker (see docs/prtag.md)
 //     are treated as project roots and scanned for nested repositories.
 //
-// A repository is only pushed or pulled when it has no uncommitted changes.
+// A repository is only pushed or pulled when it has no uncommitted changes,
+// unless the -m flag is provided to stage and commit them first.
 //
 // Local (filesystem) remotes are handled recursively so that a chain of local
 // mirrors syncs end to end:
@@ -39,18 +40,20 @@ import (
 )
 
 type opts struct {
-	mode    string // "any" or "prtag"
-	action  string // "push" or "pull"
-	all     bool   // push --all --tags
-	rebase  bool   // pull --rebase
-	dryRun  bool
-	verbose bool
+	mode      string // "any" or "prtag"
+	action    string // "push" or "pull"
+	all       bool   // push --all --tags
+	rebase    bool   // pull --rebase
+	commitMsg string // if set, commit uncommitted changes before push/pull
+	dryRun    bool
+	verbose   bool
 }
 
 func main() {
 	mode := flag.String("from", "any", `discovery mode: "any" (dirs with .git) or "prtag" (dirs with a .prtag marker, scanned for repos)`)
 	all := flag.Bool("all", false, "push all branches and tags (push only)")
 	rebase := flag.Bool("rebase", false, "pull with --rebase (pull only)")
+	commitMsg := flag.String("m", "", "commit message: if set, commit uncommitted changes before pushing or pulling")
 	dryRun := flag.Bool("n", false, "dry run: print actions without running git")
 	verbose := flag.Bool("v", false, "verbose output")
 	flag.Usage = func() {
@@ -84,7 +87,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	o := opts{mode: *mode, action: action, all: *all, rebase: *rebase, dryRun: *dryRun, verbose: *verbose}
+	o := opts{mode: *mode, action: action, all: *all, rebase: *rebase, commitMsg: *commitMsg, dryRun: *dryRun, verbose: *verbose}
 
 	repos, err := discoverRepos(*mode, roots)
 	if err != nil {
@@ -137,9 +140,9 @@ func operate(repo string, o opts, stack map[string]bool) bool {
 	}
 	local := localRemotes(repo, remotes)
 
-	clean, err := o.isClean(repo)
+	clean, err := o.maybeCommit(repo)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[error] %s: clean check: %v\n", repo, err)
+		fmt.Fprintf(os.Stderr, "[error] %s: commit: %v\n", repo, err)
 		return false
 	}
 
@@ -268,6 +271,28 @@ func (o opts) isClean(repo string) (bool, error) {
 		return false, err
 	}
 	return strings.TrimSpace(out) == "", nil
+}
+
+// maybeCommit returns true if repo has no uncommitted changes. If it does and
+// o.commitMsg is set, it stages all changes and commits them, then returns
+// true on success. When o.commitMsg is empty and the repo is dirty, it returns
+// false so the caller can skip the push/pull.
+func (o opts) maybeCommit(repo string) (bool, error) {
+	clean, err := o.isClean(repo)
+	if err != nil || clean {
+		return clean, err
+	}
+	if o.commitMsg == "" {
+		return false, nil
+	}
+	fmt.Printf("[commit] %s: %s\n", repo, o.commitMsg)
+	if err := o.git(repo, "add", "-A"); err != nil {
+		return false, fmt.Errorf("add: %w", err)
+	}
+	if err := o.git(repo, "commit", "-m", o.commitMsg); err != nil {
+		return false, fmt.Errorf("commit: %w", err)
+	}
+	return true, nil
 }
 
 // ensurePushable makes a non-bare local remote accept pushes to its current
