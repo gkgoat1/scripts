@@ -23,10 +23,18 @@
 // of ~/work propagates to ~/mirror and then to GitHub, while a pull flows the
 // other way. Cycles are prevented by tracking the repositories on the current
 // recursion path (resolved through symlinks).
+//
+// With -pr, a failed push to a GitHub remote falls back to opening (or
+// updating) a pull request via the gh CLI instead of failing outright. The PR
+// branch is named gitall-pr/<base>-<N>: if an open PR already exists from a
+// prior gitall-pr/<base>-* branch whose tip is an ancestor of the current
+// HEAD, that branch is fast-forwarded and its PR is reused; otherwise a new
+// sequentially numbered branch and PR are created.
 package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -34,6 +42,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/gkgoat1/scripts/prtag"
@@ -47,6 +56,7 @@ type opts struct {
 	commitMsg string // if set, commit uncommitted changes before push/pull
 	dryRun    bool
 	verbose   bool
+	createPR  bool // on push failure to a GitHub remote, open/update a PR via gh
 }
 
 func main() {
@@ -56,6 +66,7 @@ func main() {
 	commitMsg := flag.String("m", "", "commit message: if set, commit uncommitted changes before pushing or pulling")
 	dryRun := flag.Bool("n", false, "dry run: print actions without running git")
 	verbose := flag.Bool("v", false, "verbose output")
+	createPR := flag.Bool("pr", false, "on push failure to a GitHub remote, open/update a PR via gh")
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "usage: gitall [flags] <push|pull> [root ...]")
 		fmt.Fprintln(flag.CommandLine.Output())
@@ -87,7 +98,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	o := opts{mode: *mode, action: action, all: *all, rebase: *rebase, commitMsg: *commitMsg, dryRun: *dryRun, verbose: *verbose}
+	o := opts{mode: *mode, action: action, all: *all, rebase: *rebase, commitMsg: *commitMsg, dryRun: *dryRun, verbose: *verbose, createPR: *createPR}
 
 	repos, err := discoverRepos(*mode, roots)
 	if err != nil {
@@ -186,8 +197,16 @@ func pushRepo(repo string, clean bool, remotes []string, o opts) bool {
 		}
 		fmt.Printf("[push] %s -> %s\n", repo, r)
 		if err := o.git(repo, "push", r); err != nil {
-			fmt.Fprintf(os.Stderr, "[error] %s: push %s: %v\n", repo, r, err)
-			ok = false
+			if o.createPR {
+				if prErr := o.fallbackCreatePR(repo, r); prErr != nil {
+					fmt.Fprintf(os.Stderr, "[error] %s: push %s: %v\n", repo, r, err)
+					fmt.Fprintf(os.Stderr, "[error] %s: pr fallback %s: %v\n", repo, r, prErr)
+					ok = false
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "[error] %s: push %s: %v\n", repo, r, err)
+				ok = false
+			}
 		}
 		if o.all {
 			if err := o.git(repo, "push", r, "--all"); err != nil {
@@ -297,6 +316,210 @@ func (o opts) remotes(repo string) ([]string, error) {
 func remoteURL(repo, remote string) (string, error) {
 	out, err := capture(repo, "remote", "get-url", remote)
 	return strings.TrimSpace(out), err
+}
+
+// remotePushURL returns the URL remote actually pushes to, which may differ
+// from remoteURL if a separate push URL (or pushInsteadOf rewrite) is
+// configured for it.
+func remotePushURL(repo, remote string) (string, error) {
+	out, err := capture(repo, "remote", "get-url", "--push", remote)
+	return strings.TrimSpace(out), err
+}
+
+// ---- GitHub PR fallback ----
+
+// githubRepoSlug extracts "owner/repo" from a GitHub remote URL (SSH,
+// ssh://, or http(s)://), reporting ok=false for any other host or malformed
+// URL.
+func githubRepoSlug(url string) (string, bool) {
+	u := strings.TrimSuffix(url, ".git")
+	prefixes := []string{"git@github.com:", "ssh://git@github.com/", "https://github.com/", "http://github.com/"}
+	for _, p := range prefixes {
+		if !strings.HasPrefix(u, p) {
+			continue
+		}
+		rest := strings.TrimPrefix(u, p)
+		parts := strings.SplitN(rest, "/", 2)
+		if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+			return parts[0] + "/" + parts[1], true
+		}
+		return "", false
+	}
+	return "", false
+}
+
+// prBranchName returns the name of the Nth PR branch gitall creates for base.
+func prBranchName(base string, n int) string {
+	return fmt.Sprintf("gitall-pr/%s-%d", base, n)
+}
+
+// matchPRBranch reports whether name is a branch gitall created for base
+// (gitall-pr/<base>-<N>), returning N.
+func matchPRBranch(name, base string) (int, bool) {
+	prefix := "gitall-pr/" + base + "-"
+	if !strings.HasPrefix(name, prefix) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(name, prefix))
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+func (o opts) currentBranch(repo string) (string, error) {
+	out, err := o.capture(repo, "rev-parse", "--abbrev-ref", "HEAD")
+	return strings.TrimSpace(out), err
+}
+
+// gh runs the gh CLI in repo, streaming its output like o.git.
+func (o opts) gh(repo string, args ...string) error {
+	if o.dryRun {
+		fmt.Printf("  [dry-run] gh -C %q %s\n", repo, strings.Join(args, " "))
+		return nil
+	}
+	cmd := exec.Command("gh", args...)
+	cmd.Dir = repo
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// ghJSON runs the gh CLI in repo and decodes its JSON stdout into v.
+func (o opts) ghJSON(repo string, args []string, v any) error {
+	var out bytes.Buffer
+	cmd := exec.Command("gh", args...)
+	cmd.Dir = repo
+	cmd.Stdout = &out
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	return json.Unmarshal(out.Bytes(), v)
+}
+
+// openPR is the subset of `gh pr list --json` fields fallbackCreatePR needs.
+type openPR struct {
+	Number      int    `json:"number"`
+	HeadRefName string `json:"headRefName"`
+	HeadRefOid  string `json:"headRefOid"`
+}
+
+// openPRsFrom returns open PRs against base whose head branch was created by
+// this tool (gitall-pr/<base>-<N>), sorted ascending by N.
+func (o opts) openPRsFrom(repo, slug, base string) ([]openPR, error) {
+	var all []openPR
+	args := []string{"pr", "list", "-R", slug, "--base", base, "--state", "open", "--json", "number,headRefName,headRefOid", "--limit", "100"}
+	if err := o.ghJSON(repo, args, &all); err != nil {
+		return nil, err
+	}
+	numOf := func(pr openPR) int {
+		n, _ := matchPRBranch(pr.HeadRefName, base)
+		return n
+	}
+	var out []openPR
+	for _, pr := range all {
+		if _, ok := matchPRBranch(pr.HeadRefName, base); ok {
+			out = append(out, pr)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return numOf(out[i]) < numOf(out[j]) })
+	return out, nil
+}
+
+// remoteBranchNumbers returns all N in use by gitall-pr/<base>-<N> branches on
+// the repo at pushURL, regardless of PR state, so a closed PR's branch number
+// is never reused.
+func (o opts) remoteBranchNumbers(repo, pushURL, base string) ([]int, error) {
+	out, err := o.capture(repo, "ls-remote", "--heads", pushURL, "gitall-pr/"+base+"-*")
+	if err != nil {
+		return nil, err
+	}
+	var nums []int
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		name := strings.TrimPrefix(fields[1], "refs/heads/")
+		if n, ok := matchPRBranch(name, base); ok {
+			nums = append(nums, n)
+		}
+	}
+	return nums, nil
+}
+
+// isAncestorOfHead reports whether sha (a commit at pushURL) is an ancestor
+// of the local HEAD, fetching it first so it's available locally.
+func (o opts) isAncestorOfHead(repo, pushURL, sha string) (bool, error) {
+	if err := o.git(repo, "fetch", pushURL, sha); err != nil {
+		return false, err
+	}
+	_, err := o.capture(repo, "merge-base", "--is-ancestor", sha, "HEAD")
+	return err == nil, nil
+}
+
+// fallbackCreatePR is invoked when a push to remote fails and -pr is set. It
+// reuses an existing open PR from this tool if one's tip is an ancestor of
+// HEAD, fast-forwarding its branch; otherwise it pushes a new sequentially
+// numbered branch and opens a PR for it.
+func (o opts) fallbackCreatePR(repo, remote string) error {
+	url, err := remoteURL(repo, remote)
+	if err != nil {
+		return fmt.Errorf("remote url: %w", err)
+	}
+	slug, ok := githubRepoSlug(url)
+	if !ok {
+		return fmt.Errorf("not a GitHub remote: %s", url)
+	}
+	base, err := o.currentBranch(repo)
+	if err != nil {
+		return fmt.Errorf("current branch: %w", err)
+	}
+	if base == "HEAD" {
+		return fmt.Errorf("cannot open a PR from a detached HEAD")
+	}
+	pushURL, err := remotePushURL(repo, remote)
+	if err != nil {
+		return fmt.Errorf("remote push url: %w", err)
+	}
+
+	candidates, err := o.openPRsFrom(repo, slug, base)
+	if err != nil {
+		return fmt.Errorf("list open PRs: %w", err)
+	}
+	for _, c := range candidates {
+		ancestor, err := o.isAncestorOfHead(repo, pushURL, c.HeadRefOid)
+		if err != nil || !ancestor {
+			continue
+		}
+		fmt.Printf("[pr] %s: updating existing PR #%d (%s)\n", repo, c.Number, c.HeadRefName)
+		if err := o.git(repo, "push", remote, "HEAD:refs/heads/"+c.HeadRefName); err != nil {
+			return fmt.Errorf("push %s: %w", c.HeadRefName, err)
+		}
+		return nil
+	}
+
+	used, err := o.remoteBranchNumbers(repo, pushURL, base)
+	if err != nil {
+		return fmt.Errorf("list remote branches: %w", err)
+	}
+	n := 1
+	for _, u := range used {
+		if u >= n {
+			n = u + 1
+		}
+	}
+	head := prBranchName(base, n)
+	fmt.Printf("[pr] %s: push failed, creating PR branch %s -> %s\n", repo, head, base)
+	if err := o.git(repo, "push", remote, "HEAD:refs/heads/"+head); err != nil {
+		return fmt.Errorf("push %s: %w", head, err)
+	}
+	fmt.Printf("[pr] %s: creating pull request %s -> %s on %s\n", repo, head, base, slug)
+	if err := o.gh(repo, "pr", "create", "-R", slug, "--head", head, "--base", base, "--fill"); err != nil {
+		return fmt.Errorf("gh pr create: %w", err)
+	}
+	return nil
 }
 
 func (o opts) isClean(repo string) (bool, error) {
