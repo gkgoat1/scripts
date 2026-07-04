@@ -193,6 +193,157 @@ func TestCommitMessage(t *testing.T) {
 	}
 }
 
+func TestPushFastForwardBeforePush(t *testing.T) {
+	work, mirror, upstream := buildChain(t)
+
+	mustWrite(t, filepath.Join(upstream, "f.txt"), "remote-only\n")
+	mustRun(t, upstream, "git", "commit", "-q", "-am", "remote-only")
+	upHead := readHead(t, upstream)
+
+	if code := run([]string{"push", work}); code != 0 {
+		t.Fatalf("gitall push exit %d", code)
+	}
+	if got := readHead(t, work); got != upHead {
+		t.Errorf("work HEAD after ff push = %s, want %s", got, upHead)
+	}
+	if got := readHead(t, mirror); got != upHead {
+		t.Errorf("mirror HEAD after ff push = %s, want %s", got, upHead)
+	}
+}
+
+func TestPushPullChainOrder(t *testing.T) {
+	work, mirror, upstream := buildChain(t)
+
+	mustWrite(t, filepath.Join(upstream, "f.txt"), "upstream-first\n")
+	mustRun(t, upstream, "git", "commit", "-q", "-am", "upstream-first")
+	upHead := readHead(t, upstream)
+
+	// Mirror is behind upstream until phase-1 pull chain runs.
+	if got := readHead(t, mirror); got == upHead {
+		t.Fatal("mirror should be behind upstream before push")
+	}
+
+	if code := run([]string{"push", work}); code != 0 {
+		t.Fatalf("gitall push exit %d", code)
+	}
+	if got := readHead(t, work); got != upHead {
+		t.Errorf("work HEAD = %s, want %s", got, upHead)
+	}
+	if got := readHead(t, mirror); got != upHead {
+		t.Errorf("mirror HEAD = %s, want %s", got, upHead)
+	}
+}
+
+// divergentClean leaves work and mirror with unrelated commits on different files.
+func divergentClean(t *testing.T, work, mirror string) {
+	t.Helper()
+	mustWrite(t, filepath.Join(work, "shared.txt"), "base\n")
+	mustRun(t, work, "git", "add", "-A")
+	mustRun(t, work, "git", "commit", "-q", "-m", "base")
+	if code := run([]string{"push", work}); code != 0 {
+		t.Fatalf("setup push exit %d", code)
+	}
+	mustWrite(t, filepath.Join(mirror, "mirror.txt"), "mirror\n")
+	mustRun(t, mirror, "git", "add", "-A")
+	mustRun(t, mirror, "git", "commit", "-q", "-m", "mirror")
+	mustWrite(t, filepath.Join(work, "work.txt"), "work\n")
+	mustRun(t, work, "git", "add", "-A")
+	mustRun(t, work, "git", "commit", "-q", "-m", "work")
+}
+
+// divergentConflict leaves work and mirror with conflicting edits to the same file.
+func divergentConflict(t *testing.T, work, mirror string) {
+	t.Helper()
+	mustWrite(t, filepath.Join(work, "shared.txt"), "base\n")
+	mustRun(t, work, "git", "add", "-A")
+	mustRun(t, work, "git", "commit", "-q", "-m", "base")
+	if code := run([]string{"push", work}); code != 0 {
+		t.Fatalf("setup push exit %d", code)
+	}
+	mustWrite(t, filepath.Join(mirror, "f.txt"), "mirror\n")
+	mustRun(t, mirror, "git", "commit", "-q", "-am", "mirror")
+	mustWrite(t, filepath.Join(work, "f.txt"), "work\n")
+	mustRun(t, work, "git", "commit", "-q", "-am", "work")
+}
+
+func TestPushAllowMergeClean(t *testing.T) {
+	work, mirror, upstream := buildChain(t)
+	divergentClean(t, work, mirror)
+	workHeadBefore := readHead(t, work)
+
+	if code := run([]string{"-allow-merge", "push", work}); code != 0 {
+		t.Fatalf("gitall -allow-merge push exit %d", code)
+	}
+	workHeadAfter := readHead(t, work)
+	if workHeadAfter == workHeadBefore {
+		t.Error("work HEAD did not advance after merge")
+	}
+	if got := readHead(t, mirror); got != workHeadAfter {
+		t.Errorf("mirror HEAD = %s, want merged work %s", got, workHeadAfter)
+	}
+	if got := readHead(t, upstream); got != workHeadAfter {
+		t.Errorf("upstream HEAD = %s, want merged work %s", got, workHeadAfter)
+	}
+
+	out, err := exec.Command("git", "-C", work, "log", "-1", "--pretty=%B").Output()
+	if err != nil {
+		t.Fatalf("git log: %v", err)
+	}
+	branchOut, err := exec.Command("git", "-C", work, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	want := "gitall: merge origin/" + strings.TrimSpace(string(branchOut))
+	if !strings.Contains(string(out), want) {
+		t.Errorf("merge message = %q, want containing %q", out, want)
+	}
+}
+
+func TestPushAllowMergeWithMessage(t *testing.T) {
+	work, mirror, _ := buildChain(t)
+	divergentClean(t, work, mirror)
+
+	if code := run([]string{"-allow-merge", "-m", "sync merge", "push", work}); code != 0 {
+		t.Fatalf("gitall -allow-merge -m push exit %d", code)
+	}
+	out, err := exec.Command("git", "-C", work, "log", "-1", "--pretty=%B").Output()
+	if err != nil {
+		t.Fatalf("git log: %v", err)
+	}
+	if !strings.Contains(string(out), "sync merge") {
+		t.Errorf("merge message = %q, want containing 'sync merge'", out)
+	}
+}
+
+func TestPushAllowMergeConflict(t *testing.T) {
+	work, mirror, _ := buildChain(t)
+	divergentConflict(t, work, mirror)
+	workHead := readHead(t, work)
+
+	if code := run([]string{"-allow-merge", "push", work}); code == 0 {
+		t.Fatal("expected non-zero exit on merge conflict")
+	}
+	if got := readHead(t, work); got != workHead {
+		t.Errorf("work HEAD changed despite conflict: %s -> %s", workHead, got)
+	}
+	// mirror may still propagate via phase 3 even when work merge fails
+	_ = mirror
+}
+
+func TestPushNoMergeOnDivergence(t *testing.T) {
+	work, mirror, _ := buildChain(t)
+	divergentClean(t, work, mirror)
+	workHead := readHead(t, work)
+
+	if code := run([]string{"push", work}); code == 0 {
+		t.Fatal("expected non-zero exit when push cannot fast-forward without -allow-merge")
+	}
+	if got := readHead(t, work); got != workHead {
+		t.Errorf("work HEAD should be unchanged, got %s want %s", got, workHead)
+	}
+	_ = mirror
+}
+
 // run invokes main with the given args and returns the exit code.
 func run(args []string) int {
 	// main() calls os.Exit; run it in a goroutine by calling an extracted

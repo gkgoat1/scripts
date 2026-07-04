@@ -14,15 +14,22 @@
 // Local (filesystem) remotes are handled recursively so that a chain of local
 // mirrors syncs end to end:
 //
-//   - push:   the current repository is pushed first, then each local remote is
-//     pushed (recursively) afterwards.
+//   - push:   each local remote is pulled (recursively) first, then the current
+//     repository is synced and pushed, then each local remote is synced and
+//     pushed (recursively) afterwards. Before each push, gitall fetches the
+//     remote and fast-forwards the current branch when possible.
 //   - pull:   each local remote is pulled (recursively) first, then the current
 //     repository is pulled.
 //
 // For example, given ~/work --origin--> ~/mirror --origin--> github.com, a push
-// of ~/work propagates to ~/mirror and then to GitHub, while a pull flows the
-// other way. Cycles are prevented by tracking the repositories on the current
-// recursion path (resolved through symlinks).
+// of ~/work pulls upstream into mirror first, syncs and pushes work, then syncs
+// and pushes mirror to GitHub. A pull flows the other way. Cycles are prevented
+// by tracking the repositories on the current recursion path (resolved through
+// symlinks).
+//
+// With -allow-merge, a push that cannot fast-forward will attempt a merge
+// commit when there are no conflicts; -m sets the merge message (and still
+// commits uncommitted changes before push/pull when set).
 //
 // With -pr, a failed push to a GitHub remote falls back to opening (or
 // updating) a pull request via the gh CLI instead of failing outright. The PR
@@ -49,14 +56,26 @@ import (
 )
 
 type opts struct {
-	mode      string // "any" or "prtag"
-	action    string // "push" or "pull"
-	all       bool   // push --all --tags
-	rebase    bool   // pull --rebase
-	commitMsg string // if set, commit uncommitted changes before push/pull
-	dryRun    bool
-	verbose   bool
-	createPR  bool // on push failure to a GitHub remote, open/update a PR via gh
+	mode          string // "any" or "prtag"
+	action        string // "push" or "pull"
+	all           bool   // push --all --tags
+	rebase        bool   // pull --rebase
+	commitMsg     string // if set, commit uncommitted changes before push/pull
+	dryRun        bool
+	verbose       bool
+	createPR      bool // on push failure to a GitHub remote, open/update a PR via gh
+	allowMerge    bool // on push, merge when ff-only sync fails and there are no conflicts
+	skipPullFirst bool // internal: skip phase-1 pull chain during push recursion
+}
+
+func (o opts) withAction(action string) opts {
+	o.action = action
+	return o
+}
+
+func (o opts) withSkipPullFirst(skip bool) opts {
+	o.skipPullFirst = skip
+	return o
 }
 
 func main() {
@@ -67,6 +86,7 @@ func main() {
 	dryRun := flag.Bool("n", false, "dry run: print actions without running git")
 	verbose := flag.Bool("v", false, "verbose output")
 	createPR := flag.Bool("pr", false, "on push failure to a GitHub remote, open/update a PR via gh")
+	allowMerge := flag.Bool("allow-merge", false, "on push, merge remote changes when fast-forward is not possible (push only)")
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "usage: gitall [flags] <push|pull> [root ...]")
 		fmt.Fprintln(flag.CommandLine.Output())
@@ -98,7 +118,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	o := opts{mode: *mode, action: action, all: *all, rebase: *rebase, commitMsg: *commitMsg, dryRun: *dryRun, verbose: *verbose, createPR: *createPR}
+	o := opts{mode: *mode, action: action, all: *all, rebase: *rebase, commitMsg: *commitMsg, dryRun: *dryRun, verbose: *verbose, createPR: *createPR, allowMerge: *allowMerge}
 
 	repos, err := discoverRepos(*mode, roots)
 	if err != nil {
@@ -142,7 +162,7 @@ func main() {
 //
 // Local remotes are processed concurrently; dependency order is still honored
 // because each repository waits for its local-remote children (pull) or
-// finishes before them (push).
+// pulls them before pushing (push).
 func operate(repo string, o opts, stack map[string]bool) bool {
 	rp, err := filepath.EvalSymlinks(repo)
 	if err != nil {
@@ -169,11 +189,7 @@ func operate(repo string, o opts, stack map[string]bool) bool {
 	childStack[rp] = true
 
 	if o.action == "push" {
-		ok := pushRepo(repo, clean, remotes, o)
-		if !operateAll(repo, local, o, childStack) {
-			ok = false
-		}
-		return ok
+		return operatePush(repo, clean, remotes, local, o, childStack)
 	}
 	ok := operateAll(repo, local, o, childStack)
 	if !pullRepo(repo, clean, remotes, o) {
@@ -182,8 +198,28 @@ func operate(repo string, o opts, stack map[string]bool) bool {
 	return ok
 }
 
-// pushRepo pushes the current repository to all remotes when it is clean.
-func pushRepo(repo string, clean bool, remotes []string, o opts) bool {
+// operatePush syncs and pushes a repository in three phases: pull the local
+// remote chain first (unless skipPullFirst), sync and push the current repo,
+// then sync and push each local remote (recursively, with skipPullFirst set).
+func operatePush(repo string, clean bool, remotes, local []string, o opts, stack map[string]bool) bool {
+	ok := true
+	if !o.skipPullFirst {
+		if !operateAll(repo, local, o.withAction("pull"), stack) {
+			ok = false
+		}
+	}
+	if !syncAndPushRepo(repo, clean, remotes, o) {
+		ok = false
+	}
+	if !operateAll(repo, local, o.withSkipPullFirst(true), stack) {
+		ok = false
+	}
+	return ok
+}
+
+// syncAndPushRepo fetches and fast-forwards (or merges with -allow-merge) from
+// each remote, then pushes. PR fallback runs only after a push still fails.
+func syncAndPushRepo(repo string, clean bool, remotes []string, o opts) bool {
 	if !clean {
 		fmt.Printf("[skip] %s: uncommitted changes\n", repo)
 		return true
@@ -194,6 +230,11 @@ func pushRepo(repo string, clean bool, remotes []string, o opts) bool {
 			if lr, lok := resolveLocalRemote(repo, url); lok {
 				o.ensurePushable(lr)
 			}
+		}
+		if err := o.syncRemote(repo, r); err != nil {
+			fmt.Fprintf(os.Stderr, "[error] %s: sync %s: %v\n", repo, r, err)
+			ok = false
+			continue
 		}
 		fmt.Printf("[push] %s -> %s\n", repo, r)
 		if err := o.git(repo, "push", r); err != nil {
@@ -220,6 +261,56 @@ func pushRepo(repo string, clean bool, remotes []string, o opts) bool {
 		}
 	}
 	return ok
+}
+
+// syncRemote fetches remote and fast-forwards the current branch. When ff-only
+// fails and -allow-merge is set, it attempts a merge commit instead.
+func (o opts) syncRemote(repo, remote string) error {
+	bare, err := o.isBare(repo)
+	if err != nil {
+		return err
+	}
+	if bare {
+		return nil
+	}
+	branch, err := o.currentBranch(repo)
+	if err != nil {
+		return err
+	}
+	if branch == "HEAD" {
+		fmt.Printf("[skip] %s: sync %s: detached HEAD\n", repo, remote)
+		return nil
+	}
+	fmt.Printf("[sync] %s <- %s\n", repo, remote)
+	if err := o.git(repo, "fetch", remote); err != nil {
+		fmt.Printf("[skip] %s: sync %s: fetch failed\n", repo, remote)
+		return nil
+	}
+	ref := remote + "/" + branch
+	if !o.remoteBranchExists(repo, ref) {
+		fmt.Printf("[skip] %s: sync %s: no remote branch %s\n", repo, remote, branch)
+		return nil
+	}
+	if err := o.git(repo, "merge", "--ff-only", ref); err != nil {
+		if !o.allowMerge {
+			fmt.Printf("[sync] %s: %s: cannot fast-forward (use -allow-merge to merge)\n", repo, remote)
+			return nil
+		}
+		msg := o.commitMsg
+		if msg == "" {
+			msg = fmt.Sprintf("gitall: merge %s/%s", remote, branch)
+		}
+		fmt.Printf("[merge] %s: %s/%s\n", repo, remote, branch)
+		if err := o.git(repo, "merge", ref, "-m", msg); err != nil {
+			return fmt.Errorf("merge: %w", err)
+		}
+	}
+	return nil
+}
+
+func (o opts) remoteBranchExists(repo, ref string) bool {
+	_, err := o.capture(repo, "rev-parse", "--verify", ref)
+	return err == nil
 }
 
 // pullRepo pulls the current repository from all remotes when it is clean.
