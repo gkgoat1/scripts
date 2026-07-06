@@ -304,6 +304,7 @@ func (o opts) syncRemote(repo, remote string) error {
 		}
 		fmt.Printf("[merge] %s: %s/%s\n", repo, remote, branch)
 		if err := o.git(repo, "merge", ref, "-m", msg,"--no-ff"); err != nil {
+			o.git(repo, "merge", ref, "--abort")
 			return fmt.Errorf("merge: %w", err)
 		}
 	}
