@@ -1,2 +1,2 @@
 #!/bin/sh
-go run "$(basename "$0")/gitall" "$@"
+go run "$(dirname "$0")/gitall" "$@"
