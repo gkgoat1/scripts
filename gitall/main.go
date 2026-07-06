@@ -770,7 +770,7 @@ func discoverAny(roots []string) ([]string, error) {
 			if !d.IsDir() {
 				return nil
 			}
-			if d.Name() == ".git" || d.Name() == "Library" {
+			if strings.HasPrefix(d.Name(), ".") || d.Name() == "Library" {
 				return fs.SkipDir
 			}
 			if hasGitDir(path) {
