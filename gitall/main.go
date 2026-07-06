@@ -118,6 +118,8 @@ func main() {
 		os.Exit(2)
 	}
 
+	fmt.Printf("commitMsg: %q\n", *commitMsg)
+
 	o := opts{mode: *mode, action: action, all: *all, rebase: *rebase, commitMsg: *commitMsg, dryRun: *dryRun, verbose: *verbose, createPR: *createPR, allowMerge: *allowMerge}
 
 	repos, err := discoverRepos(*mode, roots)
@@ -301,7 +303,7 @@ func (o opts) syncRemote(repo, remote string) error {
 			msg = fmt.Sprintf("gitall: merge %s/%s", remote, branch)
 		}
 		fmt.Printf("[merge] %s: %s/%s\n", repo, remote, branch)
-		if err := o.git(repo, "merge", ref, "-m", msg); err != nil {
+		if err := o.git(repo, "merge", ref, "-m", msg,"--no-ff"); err != nil {
 			return fmt.Errorf("merge: %w", err)
 		}
 	}
