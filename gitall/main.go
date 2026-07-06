@@ -765,9 +765,11 @@ func discoverAny(roots []string) ([]string, error) {
 		}
 		err = filepath.WalkDir(r, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
-				return err
+				fmt.Fprintf(os.Stderr, "gitall: walk: %v\n", err)
+				return nil
 			}
 			if !d.IsDir() {
+				fmt.Fprintf(os.Stderr, "gitall: not a directory: %s\n", path)
 				return nil
 			}
 			if d.Name() == ".git" {
