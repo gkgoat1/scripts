@@ -769,7 +769,6 @@ func discoverAny(roots []string) ([]string, error) {
 				return nil
 			}
 			if !d.IsDir() {
-				fmt.Fprintf(os.Stderr, "gitall: not a directory: %s\n", path)
 				return nil
 			}
 			if d.Name() == ".git" {
