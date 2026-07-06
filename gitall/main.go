@@ -118,8 +118,6 @@ func main() {
 		os.Exit(2)
 	}
 
-	fmt.Printf("commitMsg: %q\n", *commitMsg)
-
 	o := opts{mode: *mode, action: action, all: *all, rebase: *rebase, commitMsg: *commitMsg, dryRun: *dryRun, verbose: *verbose, createPR: *createPR, allowMerge: *allowMerge}
 
 	repos, err := discoverRepos(*mode, roots)

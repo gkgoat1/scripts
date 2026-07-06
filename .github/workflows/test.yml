@@ -1,0 +1,36 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  go:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: go test
+        run: go test -race -coverprofile=coverage.out ./...
+      - name: upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  shell:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: install bats and shellcheck
+        run: brew install bats-core shellcheck
+      - name: shellcheck git scripts
+        continue-on-error: true
+        run: shellcheck git/*.sh || true
+      - name: bats tests
+        run: bats git/tests/

@@ -1,3 +1,3 @@
 #!/bin/sh
-ls | xargs -i ocrmypdf --skip-text {} {}
+ls | xargs -I {} ocrmypdf --skip-text {} {}
 

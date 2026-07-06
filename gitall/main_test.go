@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gkgoat1/scripts/internal/testutil"
 )
 
 // makeLocalRepo inits a git repo at dir and creates an initial commit.
@@ -377,9 +379,8 @@ func runBinary(args []string) int {
 }
 
 func TestMain(m *testing.M) {
-	// Build the binary once for the test run.
-	if err := exec.Command("go", "build", "-o", "/tmp/gitall", "./").Run(); err != nil {
-		panic(err)
-	}
+	bin := "/tmp/gitall"
+	testutil.MustBuildPackage(".", bin)
+	os.Setenv("GITALL_BIN", bin)
 	os.Exit(m.Run())
 }
