@@ -52,8 +52,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gkgoat1/scripts/prtag"
+	"github.com/gkgoat1/scripts/internal/restoreconflict"
+	"github.com/gkgoat1/scripts/interpose/config"
 	"github.com/gkgoat1/scripts/interpose/policy/tcc"
+	"github.com/gkgoat1/scripts/prtag"
 )
 
 type opts struct {
@@ -176,6 +178,11 @@ func operate(repo string, o opts, stack map[string]bool) bool {
 	remotes, err := o.remotes(repo)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[error] %s: %v\n", repo, err)
+		return false
+	}
+
+	if err := restoreConflicted(repo, o.dryRun); err != nil {
+		fmt.Fprintf(os.Stderr, "[error] %s: restore conflicts: %v\n", repo, err)
 		return false
 	}
 	local := localRemotes(repo, remotes)
@@ -302,7 +309,7 @@ func (o opts) syncRemote(repo, remote string) error {
 			msg = fmt.Sprintf("gitall: merge %s/%s", remote, branch)
 		}
 		fmt.Printf("[merge] %s: %s/%s\n", repo, remote, branch)
-		if err := o.git(repo, "merge", ref, "-m", msg,"--no-ff"); err != nil {
+		if err := o.git(repo, "merge", ref, "-m", msg, "--no-ff"); err != nil {
 			o.git(repo, "merge", ref, "--abort")
 			return fmt.Errorf("merge: %w", err)
 		}
@@ -358,6 +365,17 @@ func operateAll(parent string, repos []string, o opts, stack map[string]bool) bo
 		}
 	}
 	return ok
+}
+
+// restoreConflicted rolls back files containing conflict markers to the
+// newest snapshot-branch version that does not have them.
+func restoreConflicted(repo string, dryRun bool) error {
+	return restoreconflict.Restore(repo, restoreconflict.Options{
+		Git:    "git",
+		Prefix: config.Load().SnapshotPrefix,
+		DryRun: dryRun,
+		Out:    os.Stdout,
+	})
 }
 
 // copyStack returns a shallow copy of stack for use by child goroutines.

@@ -195,6 +195,41 @@ func TestCommitMessage(t *testing.T) {
 	}
 }
 
+func TestPushRestoresConflictedFiles(t *testing.T) {
+	work, mirror, upstream := testutil.BuildChain(t)
+
+	testutil.WriteFile(t, filepath.Join(work, "f.txt"), "clean\n")
+	testutil.Run(t, work, "git", "commit", "-q", "-am", "clean")
+	cleanHead := readHead(t, work)
+	testutil.Run(t, work, "git", "branch", "interpose/snapshot/20260707-000000_main_"+cleanHead[:7], "HEAD")
+
+	testutil.WriteFile(t, filepath.Join(work, "f.txt"), "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> other\n")
+	testutil.Run(t, work, "git", "commit", "-q", "-am", "markers")
+
+	if code := run([]string{"-m", "restored", "push", work}); code != 0 {
+		out, _ := execCombined([]string{"-m", "restored", "push", work})
+		t.Fatalf("gitall exit %d; output:\n%s", code, out)
+	}
+
+	for _, r := range []string{work, mirror, upstream} {
+		data, err := os.ReadFile(filepath.Join(r, "f.txt"))
+		if err != nil {
+			t.Fatalf("read %s: %v", r, err)
+		}
+		if string(data) != "clean\n" {
+			t.Errorf("%s content = %q, want clean", r, data)
+		}
+	}
+
+	log, err := exec.Command("git", "-C", work, "log", "-1", "--pretty=%B").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(log), "restored") {
+		t.Errorf("last commit message = %q, want 'restored'", log)
+	}
+}
+
 func TestPushFastForwardBeforePush(t *testing.T) {
 	work, mirror, upstream := buildChain(t)
 

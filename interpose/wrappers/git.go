@@ -8,11 +8,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gkgoat1/scripts/internal/restoreconflict"
 	"github.com/gkgoat1/scripts/interpose/config"
 	"github.com/gkgoat1/scripts/interpose/core"
 )
 
-// Git wraps git with snapshot branches before destructive operations.
+// Git wraps git with snapshot branches before destructive operations and
+// restores files containing conflict markers before mutating commands.
 type Git struct{}
 
 func (Git) Name() string { return "git" }
@@ -26,7 +28,9 @@ func (Git) Before(ctx *core.Context) error {
 	if core.HasFlag(ctx.Args, "--no-interpose") {
 		return nil
 	}
-	if !gitDestructive(ctx.Args) {
+	needsRestore := gitRestoreTrigger(ctx.Args)
+	needsSnapshot := gitDestructive(ctx.Args)
+	if !needsRestore && !needsSnapshot {
 		return nil
 	}
 	repo, err := gitRepoRoot(ctx.RealBinary, ctx.Args)
@@ -36,10 +40,31 @@ func (Git) Before(ctx *core.Context) error {
 	if config.SnapshotsDisabled(repo) {
 		return nil
 	}
-	return gitSnapshot(ctx.RealBinary, repo)
+	if needsRestore {
+		if rerr := restoreConflicts(ctx.RealBinary, repo); rerr != nil {
+			fmt.Fprintf(os.Stderr, "[interpose] restore conflict warning: %v\n", rerr)
+		}
+	}
+	if needsSnapshot {
+		return gitSnapshot(ctx.RealBinary, repo)
+	}
+	return nil
 }
 
 func (Git) After(_ *core.Context, _ error) error { return nil }
+
+// GitRestoreTrigger reports whether the git subcommand should trigger
+// automatic conflict restoration.
+func GitRestoreTrigger(args []string) bool { return gitRestoreTrigger(args) }
+
+func gitRestoreTrigger(args []string) bool {
+	sub := core.Subcommand(args)
+	switch sub {
+	case "add", "commit", "merge", "rebase", "cherry-pick", "pull":
+		return true
+	}
+	return false
+}
 
 func gitDestructive(args []string) bool {
 	sub := core.Subcommand(args)
@@ -192,6 +217,14 @@ func sanitizeBranch(name string) string {
 		return "branch"
 	}
 	return name
+}
+
+func restoreConflicts(realGit, repo string) error {
+	return restoreconflict.Restore(repo, restoreconflict.Options{
+		Git:    realGit,
+		Prefix: config.Load().SnapshotPrefix,
+		Out:    os.Stderr,
+	})
 }
 
 // GitDestructive exposes destructive detection for tests.
