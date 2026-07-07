@@ -83,6 +83,16 @@ func IsProtected(path string) bool {
 	return false
 }
 
+// IsProtectedDirName reports whether name is a macOS TCC-sensitive directory basename.
+func IsProtectedDirName(name string) bool {
+	for _, rel := range DefaultProtectedRelative() {
+		if name == rel {
+			return true
+		}
+	}
+	return false
+}
+
 // WouldTraverseProtected reports whether searching from root could enter protected dirs.
 func WouldTraverseProtected(root string) bool {
 	norm, err := NormalizePath(root)

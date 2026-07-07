@@ -24,6 +24,15 @@ func TestIsProtected(t *testing.T) {
 	}
 }
 
+func TestIsProtectedDirName(t *testing.T) {
+	if !tcc.IsProtectedDirName("Library") || !tcc.IsProtectedDirName("Documents") {
+		t.Error("expected TCC dir names")
+	}
+	if tcc.IsProtectedDirName("src") {
+		t.Error("src should not be protected")
+	}
+}
+
 func TestWouldTraverseProtected(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {

@@ -75,11 +75,13 @@ func TestDiscoverAnySkipsDotDirs(t *testing.T) {
 	}
 }
 
-func TestDiscoverAnySkipsLibrary(t *testing.T) {
+func TestDiscoverAnySkipsTCCDirs(t *testing.T) {
 	root := t.TempDir()
-	lib := filepath.Join(root, "Library")
-	testutil.MkdirAll(t, lib)
-	testutil.InitRepo(t, filepath.Join(lib, "proj"))
+	for _, name := range []string{"Library", "Documents", "Desktop"} {
+		dir := filepath.Join(root, name)
+		testutil.MkdirAll(t, dir)
+		testutil.InitRepo(t, filepath.Join(dir, "proj"))
+	}
 
 	repos, err := discoverAny([]string{root})
 	if err != nil {

@@ -53,6 +53,7 @@ import (
 	"strings"
 
 	"github.com/gkgoat1/scripts/prtag"
+	"github.com/gkgoat1/scripts/interpose/policy/tcc"
 )
 
 type opts struct {
@@ -755,6 +756,11 @@ func discoverRepos(mode string, roots []string) ([]string, error) {
 	return discoverAny(roots)
 }
 
+// skipWalkDir reports whether discovery should not descend into a directory.
+func skipWalkDir(name string) bool {
+	return strings.HasPrefix(name, ".") || tcc.IsProtectedDirName(name)
+}
+
 // discoverAny walks the roots and returns every directory containing a .git
 // entry. It does not descend into discovered repositories.
 func discoverAny(roots []string) ([]string, error) {
@@ -771,7 +777,7 @@ func discoverAny(roots []string) ([]string, error) {
 			if !d.IsDir() {
 				return nil
 			}
-			if strings.HasPrefix(d.Name(), ".") || d.Name() == "Library" {
+			if skipWalkDir(d.Name()) {
 				return fs.SkipDir
 			}
 			if hasGitDir(path) {
@@ -815,7 +821,7 @@ func discoverPrtag(roots []string) ([]string, error) {
 				}
 				return nil
 			}
-			if d.Name() == ".git" {
+			if d.Name() == ".git" || skipWalkDir(d.Name()) {
 				return fs.SkipDir
 			}
 			return nil
