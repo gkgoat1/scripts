@@ -11,14 +11,33 @@ security and backup tweaks first.
 # default: ~/.local/bin/interposers/{interpose,git,find,grep}
 ```
 
-Add to shell rc:
+This builds the wrappers and also adds the `PATH` export to `~/.profile` (created if
+missing) and to `~/.zshrc`/`~/.bashrc` if you already have them, inside a delimited,
+namespaced block:
 
 ```sh
+# >>> scripts:interposers >>>
+# managed by scripts installer; edits here will be overwritten - see install script --uninstall
 export PATH="$HOME/.local/bin/interposers:$PATH"
+# <<< scripts:interposers <<<
 ```
+
+Re-running the installer updates this block in place rather than duplicating it.
+Everything else in your rc files is left untouched. Restart your shell (or re-source the
+rc file) to pick up the change.
 
 `PATH` must still include `/usr/bin` (or wherever real tools live) **after** the interposer
 directory so delegation works.
+
+To remove the interposers and the `PATH` blocks they added:
+
+```sh
+./install-interposers.sh --uninstall
+```
+
+The block-editing logic lives in `installer/rcblock.sh`, a small sourceable shell
+library (`rcblock_install` / `rcblock_remove`) that future install scripts in this repo
+can reuse for their own rc-file entries.
 
 ## Wrappers
 

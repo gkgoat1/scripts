@@ -7,7 +7,7 @@ test-go:
 
 test-shell:
 	@if command -v bats >/dev/null 2>&1; then \
-		bats git/tests/; \
+		bats git/tests/ installer/tests/; \
 	else \
 		echo "bats not installed; skipping shell tests"; \
 	fi
