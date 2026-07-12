@@ -1,4 +1,4 @@
-.PHONY: test test-go test-shell coverage build-interpose
+.PHONY: test test-go test-shell coverage build-interpose build-pulse
 
 test: test-go test-shell
 
@@ -17,3 +17,6 @@ coverage: test-go
 
 build-interpose:
 	go build -o bin/interpose ./interpose
+
+build-pulse:
+	go build -o bin/pulse ./pulse
