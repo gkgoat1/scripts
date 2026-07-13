@@ -37,6 +37,10 @@
 // prior gitall-pr/<base>-* branch whose tip is an ancestor of the current
 // HEAD, that branch is fast-forwarded and its PR is reused; otherwise a new
 // sequentially numbered branch and PR are created.
+//
+// A per-command timeout can be set with -timeout (for example, -timeout=30s)
+// or via the GITALL_TIMEOUT environment variable, and a default can be
+// configured in ~/.config/interpose/config with the key "tool-timeout".
 package main
 
 import (
