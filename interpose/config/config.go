@@ -12,6 +12,7 @@ type Config struct {
 	ExtraProtectedPaths []string
 	DisableSnapshot     []string
 	SnapshotPrefix      string
+	ToolTimeout         string // duration string, e.g. "30s"
 }
 
 var loaded *Config
@@ -53,6 +54,8 @@ func Load() Config {
 			if val != "" {
 				cfg.SnapshotPrefix = val
 			}
+		case "tool-timeout":
+			cfg.ToolTimeout = val
 		}
 	}
 	loaded = &cfg

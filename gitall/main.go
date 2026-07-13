@@ -41,6 +41,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -51,6 +52,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gkgoat1/scripts/internal/restoreconflict"
 	"github.com/gkgoat1/scripts/interpose/config"
@@ -66,9 +68,10 @@ type opts struct {
 	commitMsg     string // if set, commit uncommitted changes before push/pull
 	dryRun        bool
 	verbose       bool
-	createPR      bool // on push failure to a GitHub remote, open/update a PR via gh
-	allowMerge    bool // on push, merge when ff-only sync fails and there are no conflicts
-	skipPullFirst bool // internal: skip phase-1 pull chain during push recursion
+	createPR      bool          // on push failure to a GitHub remote, open/update a PR via gh
+	allowMerge    bool          // on push, merge when ff-only sync fails and there are no conflicts
+	skipPullFirst bool          // internal: skip phase-1 pull chain during push recursion
+	timeout       time.Duration // maximum time any single external tool invocation may run
 }
 
 func (o opts) withAction(action string) opts {
@@ -81,11 +84,41 @@ func (o opts) withSkipPullFirst(skip bool) opts {
 	return o
 }
 
+// ctx returns a context for the current operation. If a timeout is configured,
+// the returned context is cancelled after that duration.
+func (o opts) ctx(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if o.timeout > 0 {
+		return context.WithTimeout(parent, o.timeout)
+	}
+	return parent, func() {}
+}
+
+// wrapTimeout improves error messages when a command is killed because it
+// exceeded the configured timeout.
+func (o opts) wrapTimeout(ctx context.Context, err error) error {
+	if err == nil || ctx.Err() != context.DeadlineExceeded {
+		return err
+	}
+	return fmt.Errorf("timed out after %s: %w", o.timeout, err)
+}
+
 func main() {
 	mode := flag.String("from", "any", `discovery mode: "any" (dirs with .git) or "prtag" (dirs with a .prtag marker, scanned for repos)`)
 	all := flag.Bool("all", false, "push all branches and tags (push only)")
 	rebase := flag.Bool("rebase", false, "pull with --rebase (pull only)")
 	commitMsg := flag.String("m", "", "commit message: if set, commit uncommitted changes before pushing or pulling")
+	timeout := flag.Duration("timeout", 0, "tool timeout: maximum time any single external command may run (e.g. 30s); 0 disables")
+	if env := os.Getenv("GITALL_TIMEOUT"); env != "" {
+		if d, err := time.ParseDuration(env); err == nil {
+			*timeout = d
+		} else {
+			fmt.Fprintf(os.Stderr, "gitall: invalid GITALL_TIMEOUT %q: %v\n", env, err)
+			os.Exit(2)
+		}
+	}
 	dryRun := flag.Bool("n", false, "dry run: print actions without running git")
 	verbose := flag.Bool("v", false, "verbose output")
 	createPR := flag.Bool("pr", false, "on push failure to a GitHub remote, open/update a PR via gh")
@@ -121,7 +154,13 @@ func main() {
 		os.Exit(2)
 	}
 
-	o := opts{mode: *mode, action: action, all: *all, rebase: *rebase, commitMsg: *commitMsg, dryRun: *dryRun, verbose: *verbose, createPR: *createPR, allowMerge: *allowMerge}
+	if *timeout == 0 {
+		if d, err := time.ParseDuration(config.Load().ToolTimeout); err == nil && d > 0 {
+			*timeout = d
+		}
+	}
+
+	o := opts{mode: *mode, action: action, all: *all, rebase: *rebase, commitMsg: *commitMsg, dryRun: *dryRun, verbose: *verbose, createPR: *createPR, allowMerge: *allowMerge, timeout: *timeout}
 
 	repos, err := discoverRepos(*mode, roots)
 	if err != nil {
@@ -185,7 +224,7 @@ func operate(repo string, o opts, stack map[string]bool) bool {
 		fmt.Fprintf(os.Stderr, "[error] %s: restore conflicts: %v\n", repo, err)
 		return false
 	}
-	local := localRemotes(repo, remotes)
+	local := localRemotes(o, repo, remotes)
 
 	clean, err := o.maybeCommit(repo)
 	if err != nil {
@@ -234,7 +273,7 @@ func syncAndPushRepo(repo string, clean bool, remotes []string, o opts) bool {
 	}
 	ok := true
 	for _, r := range remotes {
-		if url, err := remoteURL(repo, r); err == nil {
+		if url, err := o.remoteURL(repo, r); err == nil {
 			if lr, lok := resolveLocalRemote(repo, url); lok {
 				o.ensurePushable(lr)
 			}
@@ -389,10 +428,10 @@ func copyStack(stack map[string]bool) map[string]bool {
 
 // localRemotes returns the resolved filesystem paths of remotes that point to a
 // local git repository.
-func localRemotes(repo string, remotes []string) []string {
+func localRemotes(o opts, repo string, remotes []string) []string {
 	var out []string
 	for _, r := range remotes {
-		url, err := remoteURL(repo, r)
+		url, err := o.remoteURL(repo, r)
 		if err != nil {
 			continue
 		}
@@ -410,10 +449,12 @@ func (o opts) git(repo string, args ...string) error {
 		fmt.Printf("  [dry-run] git -C %q %s\n", repo, strings.Join(args, " "))
 		return nil
 	}
-	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	ctx, cancel := o.ctx(nil)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repo}, args...)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return o.wrapTimeout(ctx, cmd.Run())
 }
 
 func (o opts) remotes(repo string) ([]string, error) {
@@ -424,16 +465,16 @@ func (o opts) remotes(repo string) ([]string, error) {
 	return strings.Fields(out), nil
 }
 
-func remoteURL(repo, remote string) (string, error) {
-	out, err := capture(repo, "remote", "get-url", remote)
+func (o opts) remoteURL(repo, remote string) (string, error) {
+	out, err := o.capture(repo, "remote", "get-url", remote)
 	return strings.TrimSpace(out), err
 }
 
 // remotePushURL returns the URL remote actually pushes to, which may differ
 // from remoteURL if a separate push URL (or pushInsteadOf rewrite) is
 // configured for it.
-func remotePushURL(repo, remote string) (string, error) {
-	out, err := capture(repo, "remote", "get-url", "--push", remote)
+func (o opts) remotePushURL(repo, remote string) (string, error) {
+	out, err := o.capture(repo, "remote", "get-url", "--push", remote)
 	return strings.TrimSpace(out), err
 }
 
@@ -489,22 +530,26 @@ func (o opts) gh(repo string, args ...string) error {
 		fmt.Printf("  [dry-run] gh -C %q %s\n", repo, strings.Join(args, " "))
 		return nil
 	}
-	cmd := exec.Command("gh", args...)
+	ctx, cancel := o.ctx(nil)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gh", args...)
 	cmd.Dir = repo
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return o.wrapTimeout(ctx, cmd.Run())
 }
 
 // ghJSON runs the gh CLI in repo and decodes its JSON stdout into v.
 func (o opts) ghJSON(repo string, args []string, v any) error {
 	var out bytes.Buffer
-	cmd := exec.Command("gh", args...)
+	ctx, cancel := o.ctx(nil)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gh", args...)
 	cmd.Dir = repo
 	cmd.Stdout = &out
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return err
+		return o.wrapTimeout(ctx, err)
 	}
 	return json.Unmarshal(out.Bytes(), v)
 }
@@ -575,7 +620,7 @@ func (o opts) isAncestorOfHead(repo, pushURL, sha string) (bool, error) {
 // HEAD, fast-forwarding its branch; otherwise it pushes a new sequentially
 // numbered branch and opens a PR for it.
 func (o opts) fallbackCreatePR(repo, remote string) error {
-	url, err := remoteURL(repo, remote)
+	url, err := o.remoteURL(repo, remote)
 	if err != nil {
 		return fmt.Errorf("remote url: %w", err)
 	}
@@ -590,7 +635,7 @@ func (o opts) fallbackCreatePR(repo, remote string) error {
 	if base == "HEAD" {
 		return fmt.Errorf("cannot open a PR from a detached HEAD")
 	}
-	pushURL, err := remotePushURL(repo, remote)
+	pushURL, err := o.remotePushURL(repo, remote)
 	if err != nil {
 		return fmt.Errorf("remote push url: %w", err)
 	}
@@ -675,8 +720,10 @@ func (o opts) ensurePushable(target string) {
 		fmt.Printf("  [dry-run] git -C %q config receive.denyCurrentBranch updateInstead\n", target)
 		return
 	}
+	ctx, cancel := o.ctx(nil)
+	defer cancel()
 	var sink bytes.Buffer
-	cmd := exec.Command("git", "-C", target, "config", "receive.denyCurrentBranch", "updateInstead")
+	cmd := exec.CommandContext(ctx, "git", "-C", target, "config", "receive.denyCurrentBranch", "updateInstead")
 	cmd.Stdout = &sink
 	cmd.Stderr = &sink
 	_ = cmd.Run()
@@ -691,16 +738,14 @@ func (o opts) isBare(repo string) (bool, error) {
 }
 
 func (o opts) capture(repo string, args ...string) (string, error) {
-	return capture(repo, args...)
-}
-
-func capture(repo string, args ...string) (string, error) {
 	var out bytes.Buffer
-	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	ctx, cancel := o.ctx(nil)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repo}, args...)...)
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
-		return out.String(), err
+		return out.String(), o.wrapTimeout(ctx, err)
 	}
 	return out.String(), nil
 }
