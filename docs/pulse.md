@@ -58,6 +58,10 @@ max-load1: 4.0
   `pulse` prints `[stop] pulse: shutdown complete` only once every job has returned.
 - `-once` fires every job a single time immediately (still honoring the load gate) and exits —
   useful for smoke-testing a config before relying on it.
+- `-proxy` starts a temporary loopback HTTP(S) passthrough proxy and injects it (via
+  `HTTP_PROXY`, `HTTPS_PROXY`, and merged `NO_PROXY`) into every job shell. The proxy binds
+  only to `127.0.0.1`, forwards traffic without inspecting it, and stops when `pulse` exits.
+  This lets an existing firewall intercept child traffic separately from `pulse`'s own traffic.
 
 ## Install
 

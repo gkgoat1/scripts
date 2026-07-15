@@ -101,13 +101,64 @@ func (s *Scheduler) logf(w io.Writer, format string, args ...any) {
 
 // --- real implementations, wired in main.go ---
 
-type realCommandRunner struct{}
+type realCommandRunner struct {
+	proxyURL string
+}
 
-func (realCommandRunner) Run(shellCmd string) (int, error) {
+// proxypassEnv returns a child environment with proxy variables set or merged.
+func proxypassEnv(base []string, proxyURL string) []string {
+	noProxy := ""
+	for _, e := range base {
+		if strings.HasPrefix(e, "NO_PROXY=") {
+			noProxy = strings.TrimPrefix(e, "NO_PROXY=")
+			break
+		}
+	}
+	out := append([]string(nil), base...)
+	out = setEnv(out, "HTTP_PROXY", proxyURL)
+	out = setEnv(out, "HTTPS_PROXY", proxyURL)
+	out = setEnv(out, "NO_PROXY", mergeNoProxyDefaults(noProxy))
+	return out
+}
+
+func setEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, e := range env {
+		if len(e) >= len(prefix) && e[:len(prefix)] == prefix {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
+}
+
+func mergeNoProxyDefaults(existing string) string {
+	defaults := []string{"localhost", "127.0.0.1", "::1", "*.local"}
+	seen := make(map[string]bool)
+	for _, h := range defaults {
+		seen[h] = true
+	}
+	var extra []string
+	if existing != "" {
+		for _, h := range strings.Split(existing, ",") {
+			h = strings.TrimSpace(h)
+			if h != "" && !seen[h] {
+				seen[h] = true
+				extra = append(extra, h)
+			}
+		}
+	}
+	return strings.Join(append(defaults, extra...), ",")
+}
+
+func (r realCommandRunner) Run(shellCmd string) (int, error) {
 	cmd := exec.Command("sh", "-c", shellCmd)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	if r.proxyURL != "" {
+		cmd.Env = proxypassEnv(cmd.Environ(), r.proxyURL)
+	}
 	if err := cmd.Run(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			if status, ok := ee.Sys().(syscall.WaitStatus); ok {

@@ -58,6 +58,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gkgoat1/scripts/internal/proxypass"
 	"github.com/gkgoat1/scripts/internal/restoreconflict"
 	"github.com/gkgoat1/scripts/interpose/config"
 	"github.com/gkgoat1/scripts/interpose/policy/tcc"
@@ -65,17 +66,18 @@ import (
 )
 
 type opts struct {
-	mode          string // "any" or "prtag"
-	action        string // "push" or "pull"
-	all           bool   // push --all --tags
-	rebase        bool   // pull --rebase
-	commitMsg     string // if set, commit uncommitted changes before push/pull
+	mode          string  // "any" or "prtag"
+	action        string  // "push" or "pull"
+	all           bool    // push --all --tags
+	rebase        bool    // pull --rebase
+	commitMsg     string  // if set, commit uncommitted changes before push/pull
 	dryRun        bool
 	verbose       bool
 	createPR      bool          // on push failure to a GitHub remote, open/update a PR via gh
 	allowMerge    bool          // on push, merge when ff-only sync fails and there are no conflicts
 	skipPullFirst bool          // internal: skip phase-1 pull chain during push recursion
 	timeout       time.Duration // maximum time any single external tool invocation may run
+	proxyURL      string        // if non-empty, inject HTTP_PROXY/HTTPS_PROXY into child git processes
 }
 
 func (o opts) withAction(action string) opts {
@@ -125,6 +127,7 @@ func main() {
 	}
 	dryRun := flag.Bool("n", false, "dry run: print actions without running git")
 	verbose := flag.Bool("v", false, "verbose output")
+	proxy := flag.Bool("proxy", false, "start a loopback passthrough proxy and inject it into child git processes")
 	createPR := flag.Bool("pr", false, "on push failure to a GitHub remote, open/update a PR via gh")
 	allowMerge := flag.Bool("allow-merge", false, "on push, merge remote changes when fast-forward is not possible (push only)")
 	flag.Usage = func() {
@@ -164,7 +167,20 @@ func main() {
 		}
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	o := opts{mode: *mode, action: action, all: *all, rebase: *rebase, commitMsg: *commitMsg, dryRun: *dryRun, verbose: *verbose, createPR: *createPR, allowMerge: *allowMerge, timeout: *timeout}
+
+	if *proxy {
+		px, err := proxypass.Start(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gitall: start proxy: %v\n", err)
+			os.Exit(1)
+		}
+		o.proxyURL = px.URLString()
+		fmt.Printf("[proxy] gitall: child proxy on %s\n", o.proxyURL)
+	}
 
 	repos, err := discoverRepos(*mode, roots)
 	if err != nil {
@@ -458,7 +474,60 @@ func (o opts) git(repo string, args ...string) error {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repo}, args...)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	if o.proxyURL != "" {
+		cmd.Env = appendProxiedEnv(cmd.Environ(), cmd.Env, o.proxyURL)
+	}
 	return o.wrapTimeout(ctx, cmd.Run())
+}
+
+// appendProxiedEnv injects the proxy URL into a child process environment.
+// It respects an existing user NO_PROXY by appending, not replacing.
+func appendProxiedEnv(baseEnv []string, existing []string, proxyURL string) []string {
+	if existing == nil {
+		existing = baseEnv
+	}
+	noProxy := ""
+	for _, e := range existing {
+		if strings.HasPrefix(e, "NO_PROXY=") {
+			noProxy = strings.TrimPrefix(e, "NO_PROXY=")
+			break
+		}
+	}
+	out := append([]string(nil), existing...)
+	out = setEnv(out, "HTTP_PROXY", proxyURL)
+	out = setEnv(out, "HTTPS_PROXY", proxyURL)
+	out = setEnv(out, "NO_PROXY", mergeNoProxyDefaults(noProxy))
+	return out
+}
+
+func setEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, e := range env {
+		if len(e) >= len(prefix) && e[:len(prefix)] == prefix {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
+}
+
+func mergeNoProxyDefaults(existing string) string {
+	defaults := []string{"localhost", "127.0.0.1", "::1", "*.local"}
+	seen := make(map[string]bool)
+	for _, h := range defaults {
+		seen[h] = true
+	}
+	var extra []string
+	if existing != "" {
+		for _, h := range strings.Split(existing, ",") {
+			h = strings.TrimSpace(h)
+			if h != "" && !seen[h] {
+				seen[h] = true
+				extra = append(extra, h)
+			}
+		}
+	}
+	return strings.Join(append(defaults, extra...), ",")
 }
 
 func (o opts) remotes(repo string) ([]string, error) {

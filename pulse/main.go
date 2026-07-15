@@ -11,11 +11,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/gkgoat1/scripts/internal/proxypass"
 )
 
 func main() {
 	configPath := flag.String("config", defaultConfigPath(), "path to job config file")
 	once := flag.Bool("once", false, "fire every job once immediately and exit (ignores intervals; still honors the load gate)")
+	proxy := flag.Bool("proxy", false, "start a loopback passthrough proxy and inject it into each job")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: pulse [-config path] [-once]\n\n")
 		fmt.Fprintf(os.Stderr, "Runs the jobs defined in the config file on their configured intervals\n")
@@ -30,17 +33,29 @@ func main() {
 		os.Exit(2)
 	}
 
-	sched := NewScheduler(realCommandRunner{}, sysctlLoadChecker{}, newRealTicker, os.Stdout, os.Stderr)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	var proxyURL string
+	if *proxy {
+		px, err := proxypass.Start(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[error] pulse: start proxy: %v\n", err)
+			os.Exit(1)
+		}
+		proxyURL = px.URLString()
+		fmt.Printf("[proxy] pulse: child proxy on %s\n", proxyURL)
+	}
+
+	sched := NewScheduler(realCommandRunner{proxyURL: proxyURL}, sysctlLoadChecker{}, newRealTicker, os.Stdout, os.Stderr)
 
 	if *once {
 		for _, j := range jobs {
 			sched.fire(j)
 		}
+		fmt.Println("[stop] pulse: shutdown complete")
 		return
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	fmt.Printf("[start] pulse: %d job(s) loaded from %s\n", len(jobs), *configPath)
 	sched.Run(ctx, jobs)
