@@ -9,6 +9,10 @@ if [[ ! -x "$build/sandboxd" || "$root_dir/sandbox/daemon/main.go" -nt "$build/s
 if ! "$root_dir/sandbox/daemon/client.py" --socket "$socket" ping >/dev/null 2>&1; then
   if [[ "$(uname -s)" == Darwin ]]; then
     daemon_args=(--socket "$socket" --shim "$build/sandbox.dylib")
+    if [[ -n "${SANDBOX_HASH_UPDATERS:-}" ]]; then
+      IFS=',' read -ra hash_rules <<< "$SANDBOX_HASH_UPDATERS"
+      for rule in "${hash_rules[@]}"; do daemon_args+=(--hash-updater "$rule"); done
+    fi
     if [[ -n "${SANDBOX_ENV_ALLOW:-}" ]]; then
       IFS=',' read -ra env_rules <<< "$SANDBOX_ENV_ALLOW"
       for rule in "${env_rules[@]}"; do daemon_args+=(--env-allow "$rule"); done
@@ -23,6 +27,7 @@ if ! "$root_dir/sandbox/daemon/client.py" --socket "$socket" ping >/dev/null 2>&
 fi
 export SANDBOX_DAEMON_SOCKET="$socket"
 if [[ -n "${SANDBOX_ENV_ALLOW:-}" ]]; then export SANDBOX_ENV_POLICY=1; fi
+if [[ -n "${SANDBOX_HASH_UPDATERS:-}" ]]; then export SANDBOX_HASH_POLICY=1; fi
 case "$(uname -s)" in
  Linux) exec "$root_dir/sandbox/linux/sandbox.sh" "$@";;
  Darwin) exec "$root_dir/sandbox/macos/sandbox_wrapper.sh" "$@";;

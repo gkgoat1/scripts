@@ -1,38 +1,38 @@
 # sandboxd
 
-## Environment-variable redaction (macOS)
+The macOS daemon keeps a per-process Unix-socket connection open. The embedded
+library connects during process startup, registers its PID, and reuses that
+connection for `ENV` and `OPEN` requests. After `fork`, the child closes the
+inherited descriptor and opens a new `CLOEXEC` connection with its parent PID.
 
-Sensitive variables can be allow-listed by the SHA-256 of the executable that
-is receiving them. Configure comma-separated rules through
-`SANDBOX_ENV_ALLOW`:
+## Environment policy
+
+`SANDBOX_ENV_ALLOW` contains `VARIABLE=SHA256[,SHA256]` rules. `getenv()` is
+enforced at lookup time, rather than only during `execve`: unauthorized values
+are returned as an empty string. This means an authorized nested agent can
+continue to use a key while an intermediate spawner cannot read it. A daemon
+failure is fail-closed for configured variables.
+
+## Interpreter/code hash updates
+
+Interpreters can be authorized to change the process identity hash when they
+open a script or bytecode file:
 
 ```bash
-SANDBOX_ENV_ALLOW='OPENAI_API_KEY=HASH,ANTHROPIC_API_KEY=HASH' sandbox/run.sh agent
+SANDBOX_HASH_UPDATERS='INTERPRETER_HASH=.py,.js,.wasm' sandbox/run.sh python
 ```
 
-A rule may contain comma-separated hashes for one variable:
+The daemon accepts `--hash-updater BINARY_SHA256=EXT[,EXT]`. An `OPEN pid path`
+request updates that process's effective hash only if the current hash is an
+authorized interpreter hash and the opened path has an allowed extension. The
+new hash is the SHA-256 of the opened file. This makes environment access
+follow the interpreted code rather than the interpreter alone.
 
-```text
-OPENAI_API_KEY=HASH1,HASH2
-```
+The daemon does not trust the path supplied by the process for authorization:
+it hashes the file itself. Policies should use narrow extensions and exact
+interpreter hashes. `SOCK_CLOEXEC` is used for the connection; the daemon also
+tracks `REGISTER`, `FORK`, `ENV`, and `OPEN` requests per PID.
 
-When a sandboxed process calls `execve`, the embedded sandbox library asks the
-daemon whether the destination executable's exact bytes match an allowed hash
-for each environment variable. Every configured variable is retained only for
-matching binaries; otherwise its value is replaced with the empty string.
-The default is deny, and daemon communication failure is fail-closed.
-
-The hash is the lowercase SHA-256 digest of the executable file, before
-rewriting. This lets policy identify the intended original binary rather than a
-cache artifact. The daemon owns the comparison, so the process cannot change
-the decision locally.
-
-This mechanism protects variables across child-process exec boundaries. It does
-not protect a secret already present in a process's memory, command-line
-arguments, inherited file descriptors, or IPC channels. Keep the policy narrow
-and avoid granting an interpreter or shell hash.
-
-The daemon also always enables the hardened runtime for rewritten macOS
-binaries. Original JIT and unsigned-executable-memory entitlements are copied
-only after strict signature verification. `get-task-allow` additionally
-requires `--allow-get-task-allow` (or `SANDBOX_ALLOW_GET_TASK_ALLOW=1`).
+Rewritten macOS binaries continue to receive hardened runtime signing. Valid
+original JIT and unsigned-executable-memory entitlements are preserved;
+`get-task-allow` additionally requires the explicit daemon flag.

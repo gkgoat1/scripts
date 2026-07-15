@@ -10,81 +10,25 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
-#include <limits.h>
+#include <sys/types.h>
+#include <mach-o/dyld.h>
 
 extern char **environ;
-
-static bool env_visible(const char *path, const char *name) {
-    const char *socket_path = getenv("SANDBOX_DAEMON_SOCKET"); if (!socket_path) return false;
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0); if (fd < 0) return false;
-    struct sockaddr_un a = {.sun_family = AF_UNIX}; snprintf(a.sun_path, sizeof(a.sun_path), "%s", socket_path);
-    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { close(fd); return false; }
-    dprintf(fd, "ENV %s %s\n", path, name); char b[32] = {0}; ssize_t n = read(fd, b, sizeof(b)-1); close(fd);
-    return n >= 5 && !strncmp(b, "ALLOW", 5);
-}
-static void redact_environment(const char *path, char *const envp[]) {
-    if (!getenv("SANDBOX_ENV_POLICY")) return;
-    for (char *const *p = envp; p && *p; p++) { char *eq = strchr(*p, '='); if (!eq) continue; char name[NAME_MAX]; size_t n=(size_t)(eq-*p); if(n>=sizeof(name))continue; memcpy(name,*p,n);name[n]='\0'; if(!env_visible(path,name)) memset(eq+1,0,strlen(eq+1)); }
-}
-/* Loaded by the daemon-rewritten Mach-O via LC_LOAD_DYLIB; no environment
-   variable injection is used. */
 typedef int (*execve_fn)(const char *, char *const[], char *const[]);
-static execve_fn real_execve;
-static int resolving;
+static execve_fn real_execve; static int resolving;
+static int daemon_fd=-1; static pid_t registered_pid;
+static const char *rawenv(const char *name) { static char *(*fn)(const char *); if (!fn) fn=(char *(*)(const char *))dlsym(RTLD_NEXT,"getenv"); return fn ? fn(name) : NULL; }
+static void connect_daemon(void){const char*p=rawenv("SANDBOX_DAEMON_SOCKET");if(!p)return;daemon_fd=socket(AF_UNIX,SOCK_STREAM,0);if(daemon_fd<0)return;fcntl(daemon_fd,F_SETFD,FD_CLOEXEC);struct sockaddr_un a={.sun_family=AF_UNIX};snprintf(a.sun_path,sizeof a.sun_path,"%s",p);if(connect(daemon_fd,(void*)&a,sizeof a)<0){close(daemon_fd);daemon_fd=-1;return;}registered_pid=getpid();char b[256];snprintf(b,sizeof b,"REGISTER %d %d %s\n",registered_pid,getppid(),rawenv("_")?rawenv("_"):"unknown");write(daemon_fd,b,strlen(b));char r[16];read(daemon_fd,r,sizeof r);}
+static void init_real(void){if(!real_execve&&!resolving){resolving=1;real_execve=(execve_fn)dlsym(RTLD_NEXT,"execve");resolving=0;}if(daemon_fd<0)connect_daemon();}
+static bool ask(const char *request,const char *yes){if(daemon_fd<0)connect_daemon();if(daemon_fd<0)return false;char b[4096];snprintf(b,sizeof b,"%s\n",request);if(write(daemon_fd,b,strlen(b))<0){close(daemon_fd);daemon_fd=-1;return false;}ssize_t n=read(daemon_fd,b,sizeof b-1);if(n<=0)return false;b[n]=0;return !strncmp(b,yes,strlen(yes));}
+static void child_register(void){if(daemon_fd>=0){close(daemon_fd);daemon_fd=-1;}connect_daemon();}
+__attribute__((constructor)) static void sandbox_start(void){connect_daemon();}
 
-static void init_real(void) {
-    if (!real_execve && !resolving) {
-        resolving = 1;
-        real_execve = (execve_fn)dlsym(RTLD_NEXT, "execve");
-        resolving = 0;
-    }
-}
+int fork(void){static int(*real_fork)(void);if(!real_fork)real_fork=(int(*)(void))dlsym(RTLD_NEXT,"fork");int r=real_fork();if(r==0)child_register();return r;}
+int execve(const char *path,char *const argv[],char *const envp[]){init_real();if(!real_execve||resolving){errno=ENOSYS;return -1;}char b[4096];snprintf(b,sizeof b,"OPEN %d %s",getpid(),path);(void)ask(b,"UPDATED");int r=real_execve(path,argv,envp);return r;}
+int execv(const char *path,char *const argv[]){return execve(path,argv,environ);}
 
-static char *daemon_rewrite(const char *path) {
-    const char *socket_path = getenv("SANDBOX_DAEMON_SOCKET");
-    if (!socket_path || !*socket_path) return NULL;
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return NULL;
-    struct sockaddr_un address = {.sun_family = AF_UNIX};
-    snprintf(address.sun_path, sizeof(address.sun_path), "%s", socket_path);
-    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) { close(fd); return NULL; }
-    dprintf(fd, "REWRITE %s\n", path);
-    char response[4096]; ssize_t n = read(fd, response, sizeof(response) - 1); close(fd);
-    if (n <= 3 || strncmp(response, "OK ", 3) != 0) return NULL;
-    response[n] = '\0'; char *newline = strchr(response + 3, '\n'); if (newline) *newline = '\0';
-    return strdup(response + 3);
-}
+char *getenv(const char *name){static char*(*real_getenv)(const char*);if(!real_getenv)real_getenv=(char*(*)(const char*))dlsym(RTLD_NEXT,"getenv");if(!real_getenv)return NULL;const char *policy=real_getenv("SANDBOX_ENV_POLICY");if(policy&&strcmp(name,"SANDBOX_ENV_POLICY")&&strcmp(name,"SANDBOX_DAEMON_SOCKET")){char exe[1024];uint32_t size=sizeof(exe);if(_NSGetExecutablePath(exe,&size)==0){char req[2048];snprintf(req,sizeof req,"ENV %d %s %s",getpid(),exe,name);if(!ask(req,"ALLOW"))return "";}}return real_getenv(name);}
 
-int execve(const char *path, char *const argv[], char *const envp[]) {
-    init_real();
-    redact_environment(path, envp);
-    if (!real_execve || resolving) { errno = ENOSYS; return -1; }
-    char *rewritten = daemon_rewrite(path);
-    int result = real_execve(rewritten ? rewritten : path, argv, envp);
-    int saved = errno; free(rewritten); errno = saved; return result;
-}
-
-/* These declarations ensure callers that resolve the common exec symbols still
-   enter the execve interception. The libc implementations normally call execve. */
-int execv(const char *path, char *const argv[]) { return execve(path, argv, environ); }
-static bool allowed_path(const char *path) {
-    const char *home = getenv("HOME");
-    if (home && ((!strncmp(path, "/Documents", 10)) || strstr(path, "/Desktop/") || strstr(path, "/Downloads/"))) return false;
-    const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
-    if (base[0] == '.' && strcmp(base, ".") && strcmp(base, "..")) {
-        return !strcmp(base, ".zshrc") || !strcmp(base, ".bashrc") || !strcmp(base, ".profile") || !strcmp(base, ".bash_profile");
-    }
-    return true;
-}
-
-typedef int (*open_fn)(const char *, int, ...);
-int open(const char *path, int flags, ...) {
-    static open_fn real_open; if (!real_open) real_open = (open_fn)dlsym(RTLD_NEXT, "open");
-    if (!allowed_path(path)) { errno = EACCES; return -1; }
-    va_list ap; va_start(ap, flags); mode_t mode = (mode_t)va_arg(ap, int); va_end(ap);
-    if (flags & O_WRONLY || flags & O_RDWR || flags & O_CREAT || flags & O_TRUNC) {
-        const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
-        if (base[0] == '.') { errno = EACCES; return -1; }
-    }
-    return real_open(path, flags, mode);
-}
+static bool allowed_path(const char*p){const char*b=strrchr(p,'/');b=b?b+1:p;if(b[0]=='.'&&strcmp(b,".")&&strcmp(b,".."))return !strcmp(b,".zshrc")||!strcmp(b,".bashrc")||!strcmp(b,".profile")||!strcmp(b,".bash_profile");return !strstr(p,"/Documents/")&&!strstr(p,"/Desktop/")&&!strstr(p,"/Downloads/");}
+typedef int(*open_fn)(const char*,int,...);int open(const char*p,int f,...){static open_fn real; if(!real)real=(open_fn)dlsym(RTLD_NEXT,"open");if(!allowed_path(p)){errno=EACCES;return -1;}va_list a;va_start(a,f);mode_t m=(mode_t)va_arg(a,int);va_end(a);char req[4096];snprintf(req,sizeof req,"OPEN %d %s",getpid(),p);(void)ask(req,"UPDATED");return real(p,f,m);}

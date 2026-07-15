@@ -19,21 +19,28 @@ import (
 	"syscall"
 )
 
-type process struct{ pid, pgid int }
+type process struct {
+	pid, parent, pgid int
+	path, hash        string
+}
 type server struct {
 	socket, shim      string
 	allowGetTaskAllow bool
 	envVars           map[string]map[string]bool
+	hashUpdaters      map[string]map[string]bool
+	cacheSources      map[string]string
 	procs             map[int]process
 	mu                sync.Mutex
 }
+
+type originalEntitlements struct{ jit, unsigned, task bool }
 
 func main() {
 	if len(os.Args) >= 4 && os.Args[1] == "--client" {
 		client(os.Args[2], os.Args[3:])
 		return
 	}
-	s := &server{socket: "/tmp/sandboxd.sock", procs: map[int]process{}, envVars: map[string]map[string]bool{}}
+	s := &server{socket: "/tmp/sandboxd.sock", envVars: map[string]map[string]bool{}, hashUpdaters: map[string]map[string]bool{}, cacheSources: map[string]string{}, procs: map[int]process{}}
 	for i := 1; i < len(os.Args); i++ {
 		switch os.Args[i] {
 		case "--socket":
@@ -51,6 +58,11 @@ func main() {
 		case "--env-allow":
 			if i+1 < len(os.Args) {
 				s.addEnvPolicy(os.Args[i+1])
+				i++
+			}
+		case "--hash-updater":
+			if i+1 < len(os.Args) {
+				s.addHashUpdater(os.Args[i+1])
 				i++
 			}
 		}
@@ -78,15 +90,15 @@ func main() {
 		os.Exit(0)
 	}()
 	for {
-		c, err := l.Accept()
-		if err == nil {
+		c, e := l.Accept()
+		if e == nil {
 			go s.handle(c)
 		}
 	}
 }
 func client(socket string, args []string) {
-	c, err := net.Dial("unix", socket)
-	if err != nil {
+	c, e := net.Dial("unix", socket)
+	if e != nil {
 		os.Exit(1)
 	}
 	defer c.Close()
@@ -101,211 +113,283 @@ func killGroup(p process) {
 }
 func (s *server) handle(c net.Conn) {
 	defer c.Close()
-	line, err := bufio.NewReader(c).ReadString('\n')
-	if err != nil {
-		return
-	}
-	line = strings.TrimSuffix(line, "\n")
-	if strings.HasPrefix(line, "ENV ") {
-		f := strings.SplitN(strings.TrimPrefix(line, "ENV "), " ", 2)
-		if len(f) != 2 {
-			fmt.Fprintln(c, "ERR bad ENV request")
+	r := bufio.NewReader(c)
+	for {
+		line, e := r.ReadString('\n')
+		if e != nil {
 			return
 		}
-		if s.envAllowed(f[0], f[1]) {
+		s.command(c, strings.TrimSpace(line))
+	}
+}
+func (s *server) command(c net.Conn, line string) {
+	if line == "" {
+		return
+	}
+	f := strings.Fields(line)
+	cmd := strings.ToUpper(f[0])
+	switch cmd {
+	case "PING":
+		fmt.Fprintln(c, "OK")
+	case "REGISTER": // REGISTER pid parent path
+		if len(f) < 4 {
+			fmt.Fprintln(c, "ERR register")
+			return
+		}
+		pid, _ := strconv.Atoi(f[1])
+		parent, _ := strconv.Atoi(f[2])
+		s.register(pid, parent, f[3])
+		fmt.Fprintln(c, "OK")
+	case "FORK": // FORK child parent path
+		if len(f) < 4 {
+			fmt.Fprintln(c, "ERR fork")
+			return
+		}
+		pid, _ := strconv.Atoi(f[1])
+		parent, _ := strconv.Atoi(f[2])
+		s.register(pid, parent, f[3])
+		fmt.Fprintln(c, "OK")
+	case "ENV": // ENV pid path variable
+		if len(f) < 4 {
+			fmt.Fprintln(c, "DENY")
+			return
+		}
+		pid, _ := strconv.Atoi(f[1])
+		if s.envAllowed(pid, f[3]) {
 			fmt.Fprintln(c, "ALLOW")
 		} else {
 			fmt.Fprintln(c, "DENY")
 		}
-		return
-	}
-	if strings.HasPrefix(line, "REWRITE ") {
-		p, err := s.rewrite(strings.TrimPrefix(line, "REWRITE "))
-		if err != nil {
-			fmt.Fprintf(c, "ERR %s\n", err)
+	case "OPEN": // OPEN pid path extension-filtered code update
+		if len(f) < 3 {
+			fmt.Fprintln(c, "DENY")
 			return
 		}
-		fmt.Fprintf(c, "OK %s\n", p)
-		return
-	}
-	f := strings.Fields(line)
-	if len(f) == 0 {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	switch strings.ToUpper(f[0]) {
-	case "PING":
-		fmt.Fprintln(c, "OK")
-	case "REGISTER":
-		if len(f) >= 2 {
-			pid, _ := strconv.Atoi(f[1])
-			pgid := pid
-			if len(f) > 2 {
-				pgid, _ = strconv.Atoi(f[2])
-			}
-			s.procs[pid] = process{pid, pgid}
-			fmt.Fprintln(c, "OK")
+		pid, _ := strconv.Atoi(f[1])
+		if s.updateHash(pid, f[2]) {
+			fmt.Fprintln(c, "UPDATED")
+		} else {
+			fmt.Fprintln(c, "IGNORED")
+		}
+	case "REWRITE":
+		if len(f) < 2 {
+			fmt.Fprintln(c, "ERR rewrite")
+			return
+		}
+		p, e := s.rewrite(f[1])
+		if e != nil {
+			fmt.Fprintf(c, "ERR %s\n", e)
+		} else {
+			fmt.Fprintf(c, "OK %s\n", p)
 		}
 	case "KILL":
 		if len(f) > 1 {
 			pid, _ := strconv.Atoi(f[1])
+			s.mu.Lock()
 			if p, ok := s.procs[pid]; ok {
 				killGroup(p)
 				delete(s.procs, pid)
 			}
+			s.mu.Unlock()
 			fmt.Fprintln(c, "OK")
 		}
 	case "KILLALL":
+		s.mu.Lock()
 		for pid, p := range s.procs {
 			killGroup(p)
 			delete(s.procs, pid)
 		}
+		s.mu.Unlock()
 		fmt.Fprintln(c, "OK")
 	case "LIST":
+		s.mu.Lock()
 		for _, p := range s.procs {
-			fmt.Fprintf(c, "%d %d\n", p.pid, p.pgid)
+			fmt.Fprintf(c, "%d %d %s\n", p.pid, p.parent, p.hash)
 		}
+		s.mu.Unlock()
 	}
 }
-
+func (s *server) register(pid, parent int, path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if source, ok := s.cacheSources[path]; ok {
+		path = source
+	}
+	sum, e := fileHash(path)
+	if e != nil {
+		return
+	}
+	s.procs[pid] = process{pid: pid, parent: parent, pgid: pid, path: path, hash: sum}
+}
+func fileHash(path string) (string, error) {
+	b, e := os.ReadFile(path)
+	if e != nil {
+		return "", e
+	}
+	x := sha256.Sum256(b)
+	return hex.EncodeToString(x[:]), nil
+}
 func (s *server) addEnvPolicy(spec string) {
-	parts := strings.SplitN(spec, "=", 2)
-	if len(parts) != 2 || parts[0] == "" {
-		panic("--env-allow requires VARIABLE=SHA256")
+	p := strings.SplitN(spec, "=", 2)
+	if len(p) != 2 || p[0] == "" {
+		panic("--env-allow VARIABLE=SHA256[,SHA256]")
 	}
-	if s.envVars[parts[0]] == nil {
-		s.envVars[parts[0]] = map[string]bool{}
+	if s.envVars[p[0]] == nil {
+		s.envVars[p[0]] = map[string]bool{}
 	}
-	for _, hash := range strings.Split(parts[1], ",") {
-		if len(hash) != 64 {
+	for _, h := range strings.Split(p[1], ",") {
+		if len(h) != 64 {
 			panic("environment allow hash must be SHA-256")
 		}
-		s.envVars[parts[0]][strings.ToLower(hash)] = true
+		s.envVars[p[0]][strings.ToLower(h)] = true
 	}
 }
-func (s *server) envAllowed(path, variable string) bool {
-	data, err := os.ReadFile(path)
-	if err != nil {
+func (s *server) addHashUpdater(spec string) {
+	p := strings.SplitN(spec, "=", 2)
+	if len(p) != 2 || p[0] == "" {
+		panic("--hash-updater BINARY_SHA256=EXT[,EXT]")
+	}
+	if s.hashUpdaters[strings.ToLower(p[0])] == nil {
+		s.hashUpdaters[strings.ToLower(p[0])] = map[string]bool{}
+	}
+	for _, x := range strings.Split(p[1], ",") {
+		x = strings.ToLower(x)
+		if !strings.HasPrefix(x, ".") {
+			x = "." + x
+		}
+		s.hashUpdaters[strings.ToLower(p[0])][x] = true
+	}
+}
+func (s *server) envAllowed(pid int, varName string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	allowed := s.envVars[varName]
+	if len(allowed) == 0 {
+		return true
+	}
+	p, ok := s.procs[pid]
+	return ok && allowed[p.hash]
+}
+func (s *server) updateHash(pid int, path string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.procs[pid]
+	if !ok {
 		return false
 	}
-	sum := sha256.Sum256(data)
-	return s.envVars[variable][hex.EncodeToString(sum[:])]
+	ext := strings.ToLower(filepath.Ext(path))
+	if !s.hashUpdaters[p.hash][ext] {
+		return false
+	}
+	h, e := fileHash(path)
+	if e != nil {
+		return false
+	}
+	p.hash = h
+	p.path = path
+	s.procs[pid] = p
+	return true
 }
 
 func (s *server) rewrite(src string) (string, error) {
 	if s.shim == "" {
 		return "", fmt.Errorf("daemon has no --shim")
 	}
-	in, err := os.ReadFile(src)
-	if err != nil {
-		return "", err
+	in, e := os.ReadFile(src)
+	if e != nil {
+		return "", e
 	}
-	shim, err := os.ReadFile(s.shim)
-	if err != nil {
-		return "", err
+	shim, e := os.ReadFile(s.shim)
+	if e != nil {
+		return "", e
 	}
-	entitlements, err := readOriginalEntitlements(src)
-	if err != nil {
-		// Invalid, unsigned, or unparsable source signatures contribute no
-		// entitlements. The rewritten binary still receives the hardened runtime.
-		entitlements = originalEntitlements{}
-	}
+	orig, _ := readOriginalEntitlements(src)
 	h := sha256.New()
 	h.Write(in)
 	h.Write(shim)
-	h.Write([]byte(fmt.Sprintf("jit=%t;unsigned=%t;task=%t", entitlements.jit, entitlements.unsigned, entitlements.task && s.allowGetTaskAllow)))
+	h.Write([]byte(fmt.Sprintf("%t%t%t", orig.jit, orig.unsigned, orig.task && s.allowGetTaskAllow)))
 	name := hex.EncodeToString(h.Sum(nil))
-	cache, err := os.UserCacheDir()
-	if err != nil {
-		return "", err
+	cache, e := os.UserCacheDir()
+	if e != nil {
+		return "", e
 	}
 	dir := filepath.Join(cache, "sandbox", "binaries")
-	if err = os.MkdirAll(dir, 0700); err != nil {
-		return "", err
+	if e = os.MkdirAll(dir, 0700); e != nil {
+		return "", e
 	}
 	out := filepath.Join(dir, name)
-	if st, e := os.Stat(out); e == nil && st.Mode()&0111 != 0 {
+	if st, x := os.Stat(out); x == nil && st.Mode()&0111 != 0 {
+		s.mu.Lock()
+		s.cacheSources[out] = src
+		s.mu.Unlock()
 		return out, nil
 	}
-	if err = rewriteMachO(in, out, s.shim); err != nil {
-		return "", err
+	if e = rewriteMachO(in, out, s.shim); e != nil {
+		return "", e
 	}
 	_ = os.Chmod(out, 0755)
-	if _, e := os.Stat("/usr/bin/codesign"); e == nil {
-		if err := signHardened(out, dir, entitlements, s.allowGetTaskAllow); err != nil {
-			return "", err
+	if _, x := os.Stat("/usr/bin/codesign"); x == nil {
+		if e = signHardened(out, dir, orig, s.allowGetTaskAllow); e != nil {
+			return "", e
 		}
 	}
+	s.mu.Lock()
+	s.cacheSources[out] = src
+	s.mu.Unlock()
 	return out, nil
 }
-
-type originalEntitlements struct{ jit, unsigned, task bool }
-
 func readOriginalEntitlements(path string) (originalEntitlements, error) {
-	var result originalEntitlements
-	if err := exec.Command("codesign", "--verify", "--strict", path).Run(); err != nil {
-		return result, err
+	var r originalEntitlements
+	if e := exec.Command("codesign", "--verify", "--strict", path).Run(); e != nil {
+		return r, e
 	}
-	cmd := exec.Command("codesign", "-d", "--entitlements", ":-", path)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return result, err
+	out, e := exec.Command("codesign", "-d", "--entitlements", ":-", path).CombinedOutput()
+	if e != nil {
+		return r, e
 	}
-	dec := xml.NewDecoder(strings.NewReader(string(out)))
-	var key string
+	d := xml.NewDecoder(strings.NewReader(string(out)))
+	key := ""
 	for {
-		tok, e := dec.Token()
+		t, e := d.Token()
 		if e == io.EOF {
 			break
 		}
 		if e != nil {
-			return result, e
+			return r, e
 		}
-		switch t := tok.(type) {
-		case xml.StartElement:
-			if t.Name.Local == "key" {
+		if x, ok := t.(xml.StartElement); ok {
+			if x.Name.Local == "key" {
 				var v string
-				if e := dec.DecodeElement(&v, &t); e != nil {
-					return result, e
+				if e = d.DecodeElement(&v, &x); e != nil {
+					return r, e
 				}
 				key = v
 			}
-			if (t.Name.Local == "true" || t.Name.Local == "false") && key != "" {
-				value := t.Name.Local == "true"
+			if (x.Name.Local == "true" || x.Name.Local == "false") && key != "" {
+				v := x.Name.Local == "true"
 				switch key {
 				case "com.apple.security.cs.allow-jit":
-					result.jit = value
+					r.jit = v
 				case "com.apple.security.cs.allow-unsigned-executable-memory":
-					result.unsigned = value
+					r.unsigned = v
 				case "com.apple.security.get-task-allow":
-					result.task = value
+					r.task = v
 				}
 				key = ""
 			}
 		}
 	}
-	return result, nil
+	return r, nil
 }
-
-func signHardened(path, cacheDir string, original originalEntitlements, allowTask bool) error {
-	// --options runtime remains mandatory. Only explicitly valid source
-	// entitlements are copied; get-task-allow additionally requires a daemon flag.
-	entitlements := filepath.Join(cacheDir, "entitlements.plist")
-	task := original.task && allowTask
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>com.apple.security.cs.allow-jit</key><%s/>
-<key>com.apple.security.cs.allow-unsigned-executable-memory</key><%s/>
-<key>com.apple.security.get-task-allow</key><%s/>
-</dict></plist>
-`, boolTag(original.jit), boolTag(original.unsigned), boolTag(task))
-	if err := os.WriteFile(entitlements, []byte(plist), 0600); err != nil {
-		return err
+func signHardened(path, dir string, o originalEntitlements, allow bool) error {
+	p := filepath.Join(dir, "entitlements.plist")
+	t := o.task && allow
+	v := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>com.apple.security.cs.allow-jit</key><%s/><key>com.apple.security.cs.allow-unsigned-executable-memory</key><%s/><key>com.apple.security.get-task-allow</key><%s/></dict></plist>`, boolTag(o.jit), boolTag(o.unsigned), boolTag(t))
+	if e := os.WriteFile(p, []byte(v), 0600); e != nil {
+		return e
 	}
-	if err := exec.Command("codesign", "--force", "--sign", "-", "--timestamp=none", "--options", "runtime", "--entitlements", entitlements, path).Run(); err != nil {
-		return fmt.Errorf("hardened codesign: %w", err)
+	if e := exec.Command("codesign", "--force", "--sign", "-", "--timestamp=none", "--options", "runtime", "--entitlements", p, path).Run(); e != nil {
+		return fmt.Errorf("hardened codesign: %w", e)
 	}
 	return nil
 }
@@ -315,9 +399,6 @@ func boolTag(v bool) string {
 	}
 	return "false"
 }
-
-// rewriteMachO adds LC_LOAD_DYLIB into existing Mach-O header padding. It never
-// shifts segments or modifies offsets, and refuses binaries without safe padding.
 func rewriteMachO(in []byte, out, name string) error {
 	if len(in) < 32 || binary.LittleEndian.Uint32(in) != 0xfeedfacf {
 		return fmt.Errorf("unsupported Mach-O: expected thin 64-bit binary")
@@ -334,35 +415,35 @@ func rewriteMachO(in []byte, out, name string) error {
 		if off+8 > uint64(len(in)) {
 			return fmt.Errorf("invalid load command")
 		}
-		cmdsz := uint64(binary.LittleEndian.Uint32(in[off+4:]))
-		if cmdsz < 8 || off+cmdsz > uint64(len(in)) {
+		sz := uint64(binary.LittleEndian.Uint32(in[off+4:]))
+		if sz < 8 || off+sz > uint64(len(in)) {
 			return fmt.Errorf("invalid load command size")
 		}
-		if binary.LittleEndian.Uint32(in[off:]) == 0x19 && cmdsz >= 48 && first == 0 {
+		if binary.LittleEndian.Uint32(in[off:]) == 0x19 && sz >= 48 && first == 0 {
 			first = binary.LittleEndian.Uint64(in[off+40:])
 		}
-		off += cmdsz
+		off += sz
 	}
 	if first == 0 || first < old {
 		return fmt.Errorf("no safe load-command padding")
 	}
 	n := uint64(len(name) + 1)
-	cmdsz := (24 + n + 7) &^ 7
-	if first-old < cmdsz {
+	cs := (24 + n + 7) &^ 7
+	if first-old < cs {
 		return fmt.Errorf("no Mach-O load-command padding")
 	}
-	buf := append([]byte(nil), in...)
-	for j := old; j < old+cmdsz; j++ {
-		buf[j] = 0
+	b := append([]byte(nil), in...)
+	for j := old; j < old+cs; j++ {
+		b[j] = 0
 	}
-	binary.LittleEndian.PutUint32(buf[old:], 0xc)
-	binary.LittleEndian.PutUint32(buf[old+4:], uint32(cmdsz))
-	binary.LittleEndian.PutUint32(buf[old+8:], 24)
-	binary.LittleEndian.PutUint32(buf[old+12:], 2)
-	binary.LittleEndian.PutUint32(buf[old+16:], 0x10000)
-	binary.LittleEndian.PutUint32(buf[old+20:], 0x10000)
-	copy(buf[old+24:], name)
-	binary.LittleEndian.PutUint32(buf[16:], ncmd+1)
-	binary.LittleEndian.PutUint32(buf[20:], sizeof+uint32(cmdsz))
-	return os.WriteFile(out, buf, 0755)
+	binary.LittleEndian.PutUint32(b[old:], 0xc)
+	binary.LittleEndian.PutUint32(b[old+4:], uint32(cs))
+	binary.LittleEndian.PutUint32(b[old+8:], 24)
+	binary.LittleEndian.PutUint32(b[old+12:], 2)
+	binary.LittleEndian.PutUint32(b[old+16:], 0x10000)
+	binary.LittleEndian.PutUint32(b[old+20:], 0x10000)
+	copy(b[old+24:], name)
+	binary.LittleEndian.PutUint32(b[16:], ncmd+1)
+	binary.LittleEndian.PutUint32(b[20:], sizeof+uint32(cs))
+	return os.WriteFile(out, b, 0755)
 }
