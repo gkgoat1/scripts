@@ -12,6 +12,8 @@
 #include <unistd.h>
 
 extern char **environ;
+/* Loaded by the daemon-rewritten Mach-O via LC_LOAD_DYLIB; no environment
+   variable injection is used. */
 typedef int (*execve_fn)(const char *, char *const[], char *const[]);
 static execve_fn real_execve;
 static int resolving;

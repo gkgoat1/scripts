@@ -3,7 +3,7 @@ set -euo pipefail
 root_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd); build="$root_dir/.build"; mkdir -p "$build"
 [[ $# -gt 0 ]] || { echo 'usage: sandbox/run.sh command [args...]' >&2; exit 2; }
 shim="$build/sandbox.dylib"
-if [[ ! -f "$shim" || "$root_dir/macos/sandbox.dylib.c" -nt "$shim" ]]; then cc -dynamiclib -Wall -Wextra -O2 -o "$shim" "$root_dir/macos/sandbox.dylib.c"; codesign --force --sign - --timestamp=none "$shim"; fi
+if [[ ! -f "$shim" || "$root_dir/macos/sandbox.dylib.c" -nt "$shim" ]]; then cc -dynamiclib -Wall -Wextra -O2 -o "$shim" "$root_dir/macos/sandbox.dylib.c"; fi
 # The daemon owns Mach-O parsing, cache invalidation, rewriting, and signing.
 target=$(command -v -- "$1" || realpath -- "$1"); shift
 socket="${SANDBOX_DAEMON_SOCKET:?SANDBOX_DAEMON_SOCKET is not set}"
@@ -14,5 +14,4 @@ PY
 )
 [[ "$response" == OK\ * ]] || { echo "sandbox: daemon rewrite failed: $response" >&2; exit 1; }
 cached=${response#OK }
-export DYLD_INSERT_LIBRARIES="$shim${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}"
 exec "$cached" "$@"

@@ -179,11 +179,33 @@ func (s *server) rewrite(src string) (string, error) {
 	}
 	_ = os.Chmod(out, 0755)
 	if _, e := os.Stat("/usr/bin/codesign"); e == nil {
-		if err := exec.Command("codesign", "--force", "--sign", "-", "--timestamp=none", out).Run(); err != nil {
-			return "", fmt.Errorf("codesign: %w", err)
+		if err := signHardened(out, dir); err != nil {
+			return "", err
 		}
 	}
 	return out, nil
+}
+
+func signHardened(path, cacheDir string) error {
+	// --options runtime enables the hardened-runtime code-signing flag. The
+	// explicit plist keeps the policy visible and avoids accidentally granting
+	// JIT, unsigned executable memory, or debugger access.
+	entitlements := filepath.Join(cacheDir, "entitlements.plist")
+	const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>com.apple.security.cs.allow-jit</key><false/>
+<key>com.apple.security.cs.allow-unsigned-executable-memory</key><false/>
+<key>com.apple.security.get-task-allow</key><false/>
+</dict></plist>
+`
+	if err := os.WriteFile(entitlements, []byte(plist), 0600); err != nil {
+		return err
+	}
+	if err := exec.Command("codesign", "--force", "--sign", "-", "--timestamp=none", "--options", "runtime", "--entitlements", entitlements, path).Run(); err != nil {
+		return fmt.Errorf("hardened codesign: %w", err)
+	}
+	return nil
 }
 
 // rewriteMachO adds LC_LOAD_DYLIB into existing Mach-O header padding. It never
