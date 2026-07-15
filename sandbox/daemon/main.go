@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net"
@@ -20,9 +21,10 @@ import (
 
 type process struct{ pid, pgid int }
 type server struct {
-	socket, shim string
-	procs        map[int]process
-	mu           sync.Mutex
+	socket, shim      string
+	allowGetTaskAllow bool
+	procs             map[int]process
+	mu                sync.Mutex
 }
 
 func main() {
@@ -43,6 +45,8 @@ func main() {
 				s.shim = os.Args[i+1]
 				i++
 			}
+		case "--allow-get-task-allow":
+			s.allowGetTaskAllow = true
 		}
 	}
 	_ = os.Remove(s.socket)
@@ -158,9 +162,16 @@ func (s *server) rewrite(src string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	entitlements, err := readOriginalEntitlements(src)
+	if err != nil {
+		// Invalid, unsigned, or unparsable source signatures contribute no
+		// entitlements. The rewritten binary still receives the hardened runtime.
+		entitlements = originalEntitlements{}
+	}
 	h := sha256.New()
 	h.Write(in)
 	h.Write(shim)
+	h.Write([]byte(fmt.Sprintf("jit=%t;unsigned=%t;task=%t", entitlements.jit, entitlements.unsigned, entitlements.task && s.allowGetTaskAllow)))
 	name := hex.EncodeToString(h.Sum(nil))
 	cache, err := os.UserCacheDir()
 	if err != nil {
@@ -179,26 +190,74 @@ func (s *server) rewrite(src string) (string, error) {
 	}
 	_ = os.Chmod(out, 0755)
 	if _, e := os.Stat("/usr/bin/codesign"); e == nil {
-		if err := signHardened(out, dir); err != nil {
+		if err := signHardened(out, dir, entitlements, s.allowGetTaskAllow); err != nil {
 			return "", err
 		}
 	}
 	return out, nil
 }
 
-func signHardened(path, cacheDir string) error {
-	// --options runtime enables the hardened-runtime code-signing flag. The
-	// explicit plist keeps the policy visible and avoids accidentally granting
-	// JIT, unsigned executable memory, or debugger access.
+type originalEntitlements struct{ jit, unsigned, task bool }
+
+func readOriginalEntitlements(path string) (originalEntitlements, error) {
+	var result originalEntitlements
+	if err := exec.Command("codesign", "--verify", "--strict", path).Run(); err != nil {
+		return result, err
+	}
+	cmd := exec.Command("codesign", "-d", "--entitlements", ":-", path)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return result, err
+	}
+	dec := xml.NewDecoder(strings.NewReader(string(out)))
+	var key string
+	for {
+		tok, e := dec.Token()
+		if e == io.EOF {
+			break
+		}
+		if e != nil {
+			return result, e
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "key" {
+				var v string
+				if e := dec.DecodeElement(&v, &t); e != nil {
+					return result, e
+				}
+				key = v
+			}
+			if (t.Name.Local == "true" || t.Name.Local == "false") && key != "" {
+				value := t.Name.Local == "true"
+				switch key {
+				case "com.apple.security.cs.allow-jit":
+					result.jit = value
+				case "com.apple.security.cs.allow-unsigned-executable-memory":
+					result.unsigned = value
+				case "com.apple.security.get-task-allow":
+					result.task = value
+				}
+				key = ""
+			}
+		}
+	}
+	return result, nil
+}
+
+func signHardened(path, cacheDir string, original originalEntitlements, allowTask bool) error {
+	// --options runtime remains mandatory. Only explicitly valid source
+	// entitlements are copied; get-task-allow additionally requires a daemon flag.
 	entitlements := filepath.Join(cacheDir, "entitlements.plist")
-	const plist = `<?xml version="1.0" encoding="UTF-8"?>
+	task := original.task && allowTask
+	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>com.apple.security.cs.allow-jit</key><false/>
-<key>com.apple.security.cs.allow-unsigned-executable-memory</key><false/>
-<key>com.apple.security.get-task-allow</key><false/>
+<key>com.apple.security.cs.allow-jit</key><%s/>
+<key>com.apple.security.cs.allow-unsigned-executable-memory</key><%s/>
+<key>com.apple.security.get-task-allow</key><%s/>
 </dict></plist>
-`
+`, boolTag(original.jit), boolTag(original.unsigned), boolTag(task))
 	if err := os.WriteFile(entitlements, []byte(plist), 0600); err != nil {
 		return err
 	}
@@ -206,6 +265,12 @@ func signHardened(path, cacheDir string) error {
 		return fmt.Errorf("hardened codesign: %w", err)
 	}
 	return nil
+}
+func boolTag(v bool) string {
+	if v {
+		return "true"
+	}
+	return "false"
 }
 
 // rewriteMachO adds LC_LOAD_DYLIB into existing Mach-O header padding. It never

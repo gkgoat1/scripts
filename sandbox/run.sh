@@ -8,7 +8,9 @@ fi
 if [[ ! -x "$build/sandboxd" || "$root_dir/sandbox/daemon/main.go" -nt "$build/sandboxd" ]]; then (cd "$root_dir" && go build -o "$build/sandboxd" ./sandbox/daemon); fi
 if ! "$root_dir/sandbox/daemon/client.py" --socket "$socket" ping >/dev/null 2>&1; then
   if [[ "$(uname -s)" == Darwin ]]; then
-    "$build/sandboxd" --socket "$socket" --shim "$build/sandbox.dylib" >/dev/null 2>&1 &
+    daemon_args=(--socket "$socket" --shim "$build/sandbox.dylib")
+    if [[ "${SANDBOX_ALLOW_GET_TASK_ALLOW:-0}" == 1 ]]; then daemon_args+=(--allow-get-task-allow); fi
+    "$build/sandboxd" "${daemon_args[@]}" >/dev/null 2>&1 &
   else
     "$build/sandboxd" --socket "$socket" >/dev/null 2>&1 &
   fi
