@@ -413,6 +413,148 @@ func runBinary(args []string) int {
 	return 0
 }
 
+func TestMergeModeGating(t *testing.T) {
+	cases := []struct {
+		name    string
+		mode    MergeMode
+		isLocal bool
+		want    bool
+	}{
+		{"local/local", mergeLocal, true, true},
+		{"local/network", mergeLocal, false, false},
+		{"remote/network", mergeRemote, false, true},
+		{"remote/local", mergeRemote, true, true},
+		{"none/local", mergeNone, true, false},
+		{"none/network", mergeNone, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			work, mirror, _ := buildChain(t)
+			divergentClean(t, work, mirror)
+			workHead := readHead(t, work)
+
+			o := opts{mergeMode: c.mode}
+			updated, err := o.syncRemote(work, "origin", c.isLocal)
+			if err != nil {
+				t.Fatalf("syncRemote: %v", err)
+			}
+			if c.want {
+				if !updated {
+					t.Fatal("expected merge, but HEAD did not move")
+				}
+				if got := readHead(t, work); got == workHead {
+					t.Fatal("work HEAD did not advance after merge")
+				}
+			} else {
+				if updated {
+					t.Fatal("did not expect merge, but HEAD moved")
+				}
+				if got := readHead(t, work); got != workHead {
+					t.Fatalf("work HEAD should be unchanged, got %s want %s", got, workHead)
+				}
+			}
+		})
+	}
+}
+
+func TestParseMergeMode(t *testing.T) {
+	cases := []struct {
+		in   string
+		want MergeMode
+		ok   bool
+	}{
+		{"none", mergeNone, true},
+		{"local", mergeLocal, true},
+		{"remote", mergeRemote, true},
+		{"pr", mergePR, true},
+		{"0", mergeNone, true},
+		{"1", mergeLocal, true},
+		{"2", mergeRemote, true},
+		{"3", mergePR, true},
+		{"", mergeNone, true},
+		{"banana", mergeNone, false},
+		{"4", mergeNone, false},
+	}
+	for _, c := range cases {
+		got, ok := parseMergeMode(c.in)
+		if ok != c.ok {
+			t.Errorf("parseMergeMode(%q) ok=%v want %v", c.in, ok, c.ok)
+			continue
+		}
+		if ok && got != c.want {
+			t.Errorf("parseMergeMode(%q) = %v want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestMergeModeLocalMergesLocalRemote(t *testing.T) {
+	work, mirror, _ := buildChain(t)
+	divergentClean(t, work, mirror)
+
+	if code := run([]string{"-allow-merge=local", "push", work}); code != 0 {
+		t.Fatalf("gitall -allow-merge=local push exit %d", code)
+	}
+	if got, want := readHead(t, mirror), readHead(t, work); got != want {
+		t.Errorf("mirror HEAD = %s, want work HEAD %s", got, want)
+	}
+}
+
+func TestCheckoutHeadAfterLocalPush(t *testing.T) {
+	work, mirror, _ := buildChain(t)
+	mustWrite(t, filepath.Join(work, "f.txt"), "new\n")
+	mustRun(t, work, "git", "commit", "-q", "-am", "new")
+	workHead := readHead(t, work)
+
+	if code := run([]string{"push", work}); code != 0 {
+		t.Fatalf("gitall push exit %d", code)
+	}
+	if got := readHead(t, mirror); got != workHead {
+		t.Errorf("mirror HEAD = %s, want %s", got, workHead)
+	}
+	data, err := os.ReadFile(filepath.Join(mirror, "f.txt"))
+	if err != nil {
+		t.Fatalf("read mirror f.txt: %v", err)
+	}
+	if string(data) != "new\n" {
+		t.Errorf("mirror working tree f.txt = %q, want \"new\\n\"", string(data))
+	}
+	if err := exec.Command("git", "-C", mirror, "diff", "--exit-code", "HEAD").Run(); err != nil {
+		t.Errorf("mirror working tree differs from HEAD after push")
+	}
+}
+
+func TestRepoLockSerializesConcurrentPushes(t *testing.T) {
+	root := t.TempDir()
+	mirror := filepath.Join(root, "mirror")
+	parent1 := filepath.Join(root, "parent1")
+	parent2 := filepath.Join(root, "parent2")
+
+	makeLocalRepo(t, mirror)
+	mustRun(t, root, "git", "clone", "-q", mirror, "parent1")
+	mustRun(t, root, "git", "clone", "-q", mirror, "parent2")
+	for _, p := range []string{parent1, parent2} {
+		mustRun(t, p, "git", "config", "user.email", "t@t")
+		mustRun(t, p, "git", "config", "user.name", "t")
+	}
+
+	mustWrite(t, filepath.Join(parent1, "p1.txt"), "p1\n")
+	mustRun(t, parent1, "git", "add", "-A")
+	mustRun(t, parent1, "git", "commit", "-q", "-m", "p1")
+
+	mustWrite(t, filepath.Join(parent2, "p2.txt"), "p2\n")
+	mustRun(t, parent2, "git", "add", "-A")
+	mustRun(t, parent2, "git", "commit", "-q", "-m", "p2")
+
+	if code := run([]string{"-allow-merge=local", "push", parent1, parent2, mirror}); code != 0 {
+		t.Fatalf("gitall push exit %d", code)
+	}
+	for _, name := range []string{"p1.txt", "p2.txt"} {
+		if _, err := os.Stat(filepath.Join(mirror, name)); err != nil {
+			t.Errorf("mirror missing %s: %v", name, err)
+		}
+	}
+}
+
 func TestMain(m *testing.M) {
 	bin := "/tmp/gitall"
 	testutil.MustBuildPackage(".", bin)

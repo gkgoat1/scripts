@@ -27,16 +27,19 @@
 // by tracking the repositories on the current recursion path (resolved through
 // symlinks).
 //
-// With -allow-merge, a push that cannot fast-forward will attempt a merge
-// commit when there are no conflicts; -m sets the merge message (and still
-// commits uncommitted changes before push/pull when set).
+// With -allow-merge=<mode>, a push that cannot fast-forward can create a
+// merge commit. Valid modes are none (default), local (merge local remotes
+// only), remote (merge any remote), and pr (merge any remote and fall back to
+// a GitHub PR on push failure). Bare -allow-merge is shorthand for pr. The
+// -m flag sets the merge commit message.
 //
-// With -pr, a failed push to a GitHub remote falls back to opening (or
-// updating) a pull request via the gh CLI instead of failing outright. The PR
-// branch is named gitall-pr/<base>-<N>: if an open PR already exists from a
-// prior gitall-pr/<base>-* branch whose tip is an ancestor of the current
-// HEAD, that branch is fast-forwarded and its PR is reused; otherwise a new
-// sequentially numbered branch and PR are created.
+// With merge mode pr (or the deprecated -pr flag), a failed push to a GitHub
+// remote falls back to opening (or updating) a pull request via the gh CLI.
+// PRs are always created against the remote of the failed push, never an
+// upstream. The PR branch is named gitall-pr/<base>-<N>: if an open PR
+// already exists from a prior gitall-pr/<base>-* branch whose tip is an
+// ancestor of the current HEAD, that branch is fast-forwarded and its PR is
+// reused; otherwise a new sequentially numbered branch and PR are created.
 //
 // A per-command timeout can be set with -timeout (for example, -timeout=30s)
 // or via the GITALL_TIMEOUT environment variable, and a default can be
@@ -56,6 +59,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gkgoat1/scripts/internal/proxypass"
@@ -65,19 +69,105 @@ import (
 	"github.com/gkgoat1/scripts/prtag"
 )
 
+// MergeMode controls how gitall handles non-fast-forward situations.
+type MergeMode int
+
+const (
+	mergeNone MergeMode = iota // never merge
+	mergeLocal                 // merge into local (filesystem) remotes only
+	mergeRemote                // merge into local and network remotes
+	mergePR                    // merge into remotes, then fall back to PR on push failure
+)
+
+// expandBareAllowMerge turns a bare "-allow-merge" argument into
+// "-allow-merge=pr" so the string flag can parse it, while leaving
+// "-allow-merge=local" and friends untouched.
+func expandBareAllowMerge(args []string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		if a == "-allow-merge" || a == "--allow-merge" {
+			out[i] = "-allow-merge=pr"
+		} else {
+			out[i] = a
+		}
+	}
+	return out
+}
+
+// parseMergeMode parses a merge-mode flag value. It accepts integer levels
+// 0-3 or the names none/local/remote/pr. An empty string parses to mergeNone
+// to support the bare flag semantics elsewhere.
+func parseMergeMode(s string) (MergeMode, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "0", "none":
+		return mergeNone, true
+	case "1", "local":
+		return mergeLocal, true
+	case "2", "remote":
+		return mergeRemote, true
+	case "3", "pr":
+		return mergePR, true
+	}
+	return mergeNone, false
+}
+
+func (m MergeMode) String() string {
+	switch m {
+	case mergeNone:
+		return "none"
+	case mergeLocal:
+		return "local"
+	case mergeRemote:
+		return "remote"
+	case mergePR:
+		return "pr"
+	}
+	return fmt.Sprintf("MergeMode(%d)", int(m))
+}
+
 type opts struct {
-	mode          string  // "any" or "prtag"
-	action        string  // "push" or "pull"
-	all           bool    // push --all --tags
-	rebase        bool    // pull --rebase
-	commitMsg     string  // if set, commit uncommitted changes before push/pull
+	mode          string    // "any" or "prtag"
+	action        string    // "push" or "pull"
+	all           bool      // push --all --tags
+	rebase        bool      // pull --rebase
+	commitMsg     string    // if set, commit uncommitted changes before push/pull
 	dryRun        bool
 	verbose       bool
-	createPR      bool          // on push failure to a GitHub remote, open/update a PR via gh
-	allowMerge    bool          // on push, merge when ff-only sync fails and there are no conflicts
+	mergeMode     MergeMode     // how to handle non-fast-forward syncs and push failures
 	skipPullFirst bool          // internal: skip phase-1 pull chain during push recursion
 	timeout       time.Duration // maximum time any single external tool invocation may run
 	proxyURL      string        // if non-empty, inject HTTP_PROXY/HTTPS_PROXY into child git processes
+	locks         *repoLocks    // per-repo concurrency guard
+}
+
+// repoLocks serializes all operations on a single resolved repository path.
+type repoLocks struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+}
+
+// newRepoLocks creates an empty lock registry.
+func newRepoLocks() *repoLocks {
+	return &repoLocks{locks: make(map[string]*sync.Mutex)}
+}
+
+// withLock runs f while holding the mutex for path. The path should already
+// be resolved via filepath.EvalSymlinks.
+func (r *repoLocks) withLock(path string, f func()) {
+	if r == nil {
+		f()
+		return
+	}
+	r.mu.Lock()
+	lk, ok := r.locks[path]
+	if !ok {
+		lk = &sync.Mutex{}
+		r.locks[path] = lk
+	}
+	r.mu.Unlock()
+	lk.Lock()
+	defer lk.Unlock()
+	f()
 }
 
 func (o opts) withAction(action string) opts {
@@ -128,23 +218,29 @@ func main() {
 	dryRun := flag.Bool("n", false, "dry run: print actions without running git")
 	verbose := flag.Bool("v", false, "verbose output")
 	proxy := flag.Bool("proxy", false, "start a loopback passthrough proxy and inject it into child git processes")
-	createPR := flag.Bool("pr", false, "on push failure to a GitHub remote, open/update a PR via gh")
-	allowMerge := flag.Bool("allow-merge", false, "on push, merge remote changes when fast-forward is not possible (push only)")
+	// -pr is retained as an alias for -allow-merge=pr.
+	prFlag := flag.Bool("pr", false, "deprecated: use -allow-merge=pr instead")
+
+	// -allow-merge now accepts a value (none/local/remote/pr or 0-3) in
+	// addition to the old bare flag, which maps to the most permissive mode.
+	// Expand a bare "-allow-merge" to "-allow-merge=pr" before flag.Parse.
+	args := expandBareAllowMerge(os.Args[1:])
+	mergeStr := flag.String("allow-merge", "none", "merge mode on non-fast-forward: none (default), local, remote, pr (bare flag means pr)")
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "usage: gitall [flags] <push|pull> [root ...]")
 		fmt.Fprintln(flag.CommandLine.Output())
 		fmt.Fprintln(flag.CommandLine.Output(), "flags:")
 		flag.PrintDefaults()
 	}
-	flag.Parse()
+	flag.CommandLine.Parse(args)
 
-	args := flag.Args()
-	if len(args) == 0 {
+	cmdArgs := flag.Args()
+	if len(cmdArgs) == 0 {
 		flag.Usage()
 		os.Exit(2)
 	}
-	action := strings.ToLower(args[0])
-	roots := args[1:]
+	action := strings.ToLower(cmdArgs[0])
+	roots := cmdArgs[1:]
 	if len(roots) == 0 {
 		roots = []string{"."}
 	}
@@ -167,10 +263,31 @@ func main() {
 		}
 	}
 
+	mergeMode, ok := parseMergeMode(*mergeStr)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "gitall: -allow-merge must be none, local, remote, pr, or 0-3, got %q\n", *mergeStr)
+		os.Exit(2)
+	}
+
+	if *prFlag {
+		mergeMode = mergePR
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	o := opts{mode: *mode, action: action, all: *all, rebase: *rebase, commitMsg: *commitMsg, dryRun: *dryRun, verbose: *verbose, createPR: *createPR, allowMerge: *allowMerge, timeout: *timeout}
+	o := opts{
+		mode:      *mode,
+		action:    action,
+		all:       *all,
+		rebase:    *rebase,
+		commitMsg: *commitMsg,
+		dryRun:    *dryRun,
+		verbose:   *verbose,
+		mergeMode: mergeMode,
+		timeout:   *timeout,
+		locks:     newRepoLocks(),
+	}
 
 	if *proxy {
 		px, err := proxypass.Start(ctx)
@@ -225,6 +342,9 @@ func main() {
 // Local remotes are processed concurrently; dependency order is still honored
 // because each repository waits for its local-remote children (pull) or
 // pulls them before pushing (push).
+//
+// Access to each resolved repo is serialized by o.locks so concurrent pushes
+// or pulls to the same repository do not corrupt refs, index, or working tree.
 func operate(repo string, o opts, stack map[string]bool) bool {
 	rp, err := filepath.EvalSymlinks(repo)
 	if err != nil {
@@ -234,6 +354,14 @@ func operate(repo string, o opts, stack map[string]bool) bool {
 		return true // cycle: already on this recursion path
 	}
 
+	var ok bool
+	o.locks.withLock(rp, func() {
+		ok = operateLocked(repo, rp, o, stack)
+	})
+	return ok
+}
+
+func operateLocked(repo, rp string, o opts, stack map[string]bool) bool {
 	remotes, err := o.remotes(repo)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[error] %s: %v\n", repo, err)
@@ -284,8 +412,29 @@ func operatePush(repo string, clean bool, remotes, local []string, o opts, stack
 	return ok
 }
 
-// syncAndPushRepo fetches and fast-forwards (or merges with -allow-merge) from
-// each remote, then pushes. PR fallback runs only after a push still fails.
+// checkoutHead updates the working tree of repo to match HEAD. It is used
+// after a local repo has been updated by push or pull so its checked-out
+// branch stays in sync with the new HEAD. Failures are logged but not fatal.
+func checkoutHead(repo string, o opts) {
+	if o.dryRun {
+		fmt.Printf("  [dry-run] git -C %q checkout HEAD\n", repo)
+		return
+	}
+	if bare, err := o.isBare(repo); err == nil && bare {
+		return
+	}
+	if err := o.git(repo, "checkout", "HEAD"); err != nil {
+		fmt.Fprintf(os.Stderr, "[error] %s: checkout HEAD: %v\n", repo, err)
+	}
+}
+
+// syncAndPushRepo fetches and fast-forwards (or merges according to mergeMode)
+// from each remote, then pushes. PR fallback runs only when mergeMode >= mergePR
+// and a push to a network remote fails.
+//
+// For local remotes, both the sync (fetch/merge into the current repo) and the
+// push into the target repo are protected by the target repo's mutex so that
+// concurrent pushes to the same local mirror do not corrupt its refs.
 func syncAndPushRepo(repo string, clean bool, remotes []string, o opts) bool {
 	if !clean {
 		fmt.Printf("[skip] %s: uncommitted changes\n", repo)
@@ -293,37 +442,74 @@ func syncAndPushRepo(repo string, clean bool, remotes []string, o opts) bool {
 	}
 	ok := true
 	for _, r := range remotes {
-		if url, err := o.remoteURL(repo, r); err == nil {
+		url, urlErr := o.remoteURL(repo, r)
+		isLocal := false
+		var localPath string
+		if urlErr == nil {
 			if lr, lok := resolveLocalRemote(repo, url); lok {
+				isLocal = true
+				localPath = lr
 				o.ensurePushable(lr)
 			}
 		}
-		if err := o.syncRemote(repo, r); err != nil {
+
+		// Lock local remotes while reading/writing them so concurrent
+		// pushes from different source repos do not corrupt refs.
+		var updated bool
+		var err error
+		if isLocal && localPath != "" {
+			o.locks.withLock(localPath, func() {
+				updated, err = o.syncRemote(repo, r, isLocal)
+			})
+		} else {
+			updated, err = o.syncRemote(repo, r, isLocal)
+		}
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "[error] %s: sync %s: %v\n", repo, r, err)
 			ok = false
 			continue
 		}
+		if updated {
+			checkoutHead(repo, o)
+		}
+
 		fmt.Printf("[push] %s -> %s\n", repo, r)
-		if err := o.git(repo, "push", r); err != nil {
-			if o.createPR {
-				if prErr := o.fallbackCreatePR(repo, r); prErr != nil {
-					fmt.Fprintf(os.Stderr, "[error] %s: push %s: %v\n", repo, r, err)
-					fmt.Fprintf(os.Stderr, "[error] %s: pr fallback %s: %v\n", repo, r, prErr)
+		push := func() error {
+			if err := o.git(repo, "push", r); err != nil {
+				return err
+			}
+			if o.all {
+				if err := o.git(repo, "push", r, "--all"); err != nil {
+					return fmt.Errorf("push --all: %w", err)
+				}
+				if err := o.git(repo, "push", r, "--tags"); err != nil {
+					return fmt.Errorf("push --tags: %w", err)
+				}
+			}
+			return nil
+		}
+
+		if isLocal && localPath != "" {
+			o.locks.withLock(localPath, func() {
+				if perr := push(); perr != nil {
+					fmt.Fprintf(os.Stderr, "[error] %s: push %s: %v\n", repo, r, perr)
+					ok = false
+					return
+				}
+				checkoutHead(localPath, o)
+			})
+		} else {
+			if perr := push(); perr != nil {
+				if o.mergeMode >= mergePR {
+					if prErr := o.fallbackCreatePR(repo, r); prErr != nil {
+						fmt.Fprintf(os.Stderr, "[error] %s: push %s: %v\n", repo, r, perr)
+						fmt.Fprintf(os.Stderr, "[error] %s: pr fallback %s: %v\n", repo, r, prErr)
+						ok = false
+					}
+				} else {
+					fmt.Fprintf(os.Stderr, "[error] %s: push %s: %v\n", repo, r, perr)
 					ok = false
 				}
-			} else {
-				fmt.Fprintf(os.Stderr, "[error] %s: push %s: %v\n", repo, r, err)
-				ok = false
-			}
-		}
-		if o.all {
-			if err := o.git(repo, "push", r, "--all"); err != nil {
-				fmt.Fprintf(os.Stderr, "[error] %s: push --all %s: %v\n", repo, r, err)
-				ok = false
-			}
-			if err := o.git(repo, "push", r, "--tags"); err != nil {
-				fmt.Fprintf(os.Stderr, "[error] %s: push --tags %s: %v\n", repo, r, err)
-				ok = false
 			}
 		}
 	}
@@ -331,37 +517,46 @@ func syncAndPushRepo(repo string, clean bool, remotes []string, o opts) bool {
 }
 
 // syncRemote fetches remote and fast-forwards the current branch. When ff-only
-// fails and -allow-merge is set, it attempts a merge commit instead.
-func (o opts) syncRemote(repo, remote string) error {
+// fails it may create a merge commit depending on mergeMode and whether the
+// remote is local. It returns true if HEAD moved (new commit reachable) and
+// false if nothing changed.
+func (o opts) syncRemote(repo, remote string, isLocal bool) (bool, error) {
+	beforeHead, err := o.capture(repo, "rev-parse", "HEAD")
+	if err != nil {
+		return false, err
+	}
+	beforeHead = strings.TrimSpace(beforeHead)
+
 	bare, err := o.isBare(repo)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if bare {
-		return nil
+		return false, nil
 	}
 	branch, err := o.currentBranch(repo)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if branch == "HEAD" {
 		fmt.Printf("[skip] %s: sync %s: detached HEAD\n", repo, remote)
-		return nil
+		return false, nil
 	}
 	fmt.Printf("[sync] %s <- %s\n", repo, remote)
 	if err := o.git(repo, "fetch", remote); err != nil {
 		fmt.Printf("[skip] %s: sync %s: fetch failed\n", repo, remote)
-		return nil
+		return false, nil
 	}
 	ref := remote + "/" + branch
 	if !o.remoteBranchExists(repo, ref) {
 		fmt.Printf("[skip] %s: sync %s: no remote branch %s\n", repo, remote, branch)
-		return nil
+		return false, nil
 	}
 	if err := o.git(repo, "merge", "--ff-only", ref); err != nil {
-		if !o.allowMerge {
+		canMerge := o.mergeMode >= mergeRemote || (isLocal && o.mergeMode >= mergeLocal)
+		if !canMerge {
 			fmt.Printf("[sync] %s: %s: cannot fast-forward (use -allow-merge to merge)\n", repo, remote)
-			return nil
+			return false, nil
 		}
 		msg := o.commitMsg
 		if msg == "" {
@@ -369,11 +564,17 @@ func (o opts) syncRemote(repo, remote string) error {
 		}
 		fmt.Printf("[merge] %s: %s/%s\n", repo, remote, branch)
 		if err := o.git(repo, "merge", ref, "-m", msg, "--no-ff"); err != nil {
-			o.git(repo, "merge", ref, "--abort")
-			return fmt.Errorf("merge: %w", err)
+			o.git(repo, "merge", "--abort")
+			return false, fmt.Errorf("merge: %w", err)
 		}
 	}
-	return nil
+
+	afterHead, err := o.capture(repo, "rev-parse", "HEAD")
+	if err != nil {
+		return false, err
+	}
+	afterHead = strings.TrimSpace(afterHead)
+	return beforeHead != afterHead, nil
 }
 
 func (o opts) remoteBranchExists(repo, ref string) bool {
@@ -382,6 +583,8 @@ func (o opts) remoteBranchExists(repo, ref string) bool {
 }
 
 // pullRepo pulls the current repository from all remotes when it is clean.
+// After each successful pull, it checks out HEAD so the working tree matches
+// the (possibly moved) HEAD.
 func pullRepo(repo string, clean bool, remotes []string, o opts) bool {
 	if !clean {
 		fmt.Printf("[skip] %s: uncommitted changes\n", repo)
@@ -398,7 +601,9 @@ func pullRepo(repo string, clean bool, remotes []string, o opts) bool {
 		if err := o.git(repo, args...); err != nil {
 			fmt.Fprintf(os.Stderr, "[error] %s: pull %s: %v\n", repo, r, err)
 			ok = false
+			continue
 		}
+		checkoutHead(repo, o)
 	}
 	return ok
 }
@@ -688,11 +893,18 @@ func (o opts) isAncestorOfHead(repo, pushURL, sha string) (bool, error) {
 	return err == nil, nil
 }
 
-// fallbackCreatePR is invoked when a push to remote fails and -pr is set. It
-// reuses an existing open PR from this tool if one's tip is an ancestor of
+// fallbackCreatePR is invoked when a push to remote fails and mergeMode >= mergePR.
+// It reuses an existing open PR from this tool if one's tip is an ancestor of
 // HEAD, fast-forwarding its branch; otherwise it pushes a new sequentially
 // numbered branch and opens a PR for it.
+// PRs are always created against the named remote's repository (its fetch
+// URL slug) so they target the remote that is configured for this repo,
+// never an inferred upstream.
 func (o opts) fallbackCreatePR(repo, remote string) error {
+	pushURL, err := o.remotePushURL(repo, remote)
+	if err != nil {
+		return fmt.Errorf("remote push url: %w", err)
+	}
 	url, err := o.remoteURL(repo, remote)
 	if err != nil {
 		return fmt.Errorf("remote url: %w", err)
@@ -707,10 +919,6 @@ func (o opts) fallbackCreatePR(repo, remote string) error {
 	}
 	if base == "HEAD" {
 		return fmt.Errorf("cannot open a PR from a detached HEAD")
-	}
-	pushURL, err := o.remotePushURL(repo, remote)
-	if err != nil {
-		return fmt.Errorf("remote push url: %w", err)
 	}
 
 	candidates, err := o.openPRsFrom(repo, slug, base)

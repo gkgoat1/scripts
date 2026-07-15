@@ -24,8 +24,8 @@ If no roots are given, `.` is used.
 | `-n` | false | Dry run: print actions without running `git`. |
 | `-v` | false | Verbose output. |
 | `-proxy` | false | Start a loopback HTTP(S) passthrough proxy and inject it into child `git` processes. |
-| `-pr` | false | On push failure to a GitHub remote, open or update a PR via `gh`. |
-| `-allow-merge` | false | Merge remote changes when fast-forward is not possible (`push` only). |
+| `-allow-merge` | `none` | Merge mode on non-fast-forward (`push` only): `none`, `local`, `remote`, or `pr`. Bare `-allow-merge` is shorthand for `pr`. |
+| `-pr` | false | Deprecated alias for `-allow-merge=pr`. |
 | `-timeout` | `0` | Maximum time any single external command may run (e.g. `30s`). `0` disables. |
 
 ## Discovery modes
@@ -45,6 +45,50 @@ Local remotes are resolved and handled recursively. Given a chain such as
 - `gitall pull`: pulls the chain in the opposite direction.
 
 Cycles are prevented by tracking repositories on the current recursion path.
+
+## Merge modes (`-allow-merge`)
+
+`-allow-merge` controls what `gitall` does when a fast-forward sync is not
+possible while pushing. It accepts one of four levels:
+
+| Mode | Meaning |
+|------|---------|
+| `none` (default) | Never merge; report the divergence and continue. |
+| `local` | Merge only when the remote is a local (filesystem) path. |
+| `remote` | Merge both local and network remotes. |
+| `pr` | Same as `remote`, and when a push to a GitHub remote still fails, fall back to opening or updating a PR via `gh`. |
+
+Examples:
+
+```sh
+gitall -allow-merge=local push ~/work        # merge into local mirrors only
+gitall -allow-merge=remote push ~/work       # merge into any remote
+gitall -allow-merge=pr push ~/work           # merge + PR fallback
+gitall -allow-merge push ~/work              # shorthand for -allow-merge=pr
+```
+
+The old boolean `-allow-merge` flag is retained as a shorthand for `-allow-merge=pr`, and `-pr` is retained as a deprecated alias for the same thing.
+
+## `checkout HEAD` after updates
+
+Whenever `gitall` updates a repository—whether by merge, pull, or pushing into a
+local remote—it runs `git checkout HEAD` in that repository afterward. Working
+tree mismatches after a remote update are therefore reconciled automatically.
+Failures are logged but not fatal.
+
+## Per-repo concurrency guard
+
+Every resolved repository path is protected by a per-invocation mutex. Two
+independent source repositories that share a local remote cannot mutate that
+remote at the same time, eliminating race conditions on refs, index, and
+working tree. The mutex is held for the entire `operate` call and also across
+pushes/fetches into local remotes.
+
+## PR targets
+
+When PR fallback is triggered, `gitall` always creates the PR against the
+remote named in the failed push, using that remote's configured fetch URL slug
+(e.g. `-R owner/repo`). It never infers or falls back to an `upstream` remote.
 
 ## Proxy passthrough (`-proxy`)
 
