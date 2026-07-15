@@ -23,6 +23,7 @@ type process struct{ pid, pgid int }
 type server struct {
 	socket, shim      string
 	allowGetTaskAllow bool
+	envVars           map[string]map[string]bool
 	procs             map[int]process
 	mu                sync.Mutex
 }
@@ -32,7 +33,7 @@ func main() {
 		client(os.Args[2], os.Args[3:])
 		return
 	}
-	s := &server{socket: "/tmp/sandboxd.sock", procs: map[int]process{}}
+	s := &server{socket: "/tmp/sandboxd.sock", procs: map[int]process{}, envVars: map[string]map[string]bool{}}
 	for i := 1; i < len(os.Args); i++ {
 		switch os.Args[i] {
 		case "--socket":
@@ -47,6 +48,11 @@ func main() {
 			}
 		case "--allow-get-task-allow":
 			s.allowGetTaskAllow = true
+		case "--env-allow":
+			if i+1 < len(os.Args) {
+				s.addEnvPolicy(os.Args[i+1])
+				i++
+			}
 		}
 	}
 	_ = os.Remove(s.socket)
@@ -100,6 +106,19 @@ func (s *server) handle(c net.Conn) {
 		return
 	}
 	line = strings.TrimSuffix(line, "\n")
+	if strings.HasPrefix(line, "ENV ") {
+		f := strings.SplitN(strings.TrimPrefix(line, "ENV "), " ", 2)
+		if len(f) != 2 {
+			fmt.Fprintln(c, "ERR bad ENV request")
+			return
+		}
+		if s.envAllowed(f[0], f[1]) {
+			fmt.Fprintln(c, "ALLOW")
+		} else {
+			fmt.Fprintln(c, "DENY")
+		}
+		return
+	}
 	if strings.HasPrefix(line, "REWRITE ") {
 		p, err := s.rewrite(strings.TrimPrefix(line, "REWRITE "))
 		if err != nil {
@@ -148,6 +167,30 @@ func (s *server) handle(c net.Conn) {
 			fmt.Fprintf(c, "%d %d\n", p.pid, p.pgid)
 		}
 	}
+}
+
+func (s *server) addEnvPolicy(spec string) {
+	parts := strings.SplitN(spec, "=", 2)
+	if len(parts) != 2 || parts[0] == "" {
+		panic("--env-allow requires VARIABLE=SHA256")
+	}
+	if s.envVars[parts[0]] == nil {
+		s.envVars[parts[0]] = map[string]bool{}
+	}
+	for _, hash := range strings.Split(parts[1], ",") {
+		if len(hash) != 64 {
+			panic("environment allow hash must be SHA-256")
+		}
+		s.envVars[parts[0]][strings.ToLower(hash)] = true
+	}
+}
+func (s *server) envAllowed(path, variable string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	sum := sha256.Sum256(data)
+	return s.envVars[variable][hex.EncodeToString(sum[:])]
 }
 
 func (s *server) rewrite(src string) (string, error) {

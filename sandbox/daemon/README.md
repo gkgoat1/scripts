@@ -1,27 +1,38 @@
 # sandboxd
 
-On macOS, `sandboxd` always signs rewritten binaries with the hardened-runtime
-option. It reads entitlements from the original binary only after:
+## Environment-variable redaction (macOS)
 
-1. `codesign --verify --strict` succeeds; and
-2. `codesign -d --entitlements :-` produces valid plist output.
+Sensitive variables can be allow-listed by the SHA-256 of the executable that
+is receiving them. Configure comma-separated rules through
+`SANDBOX_ENV_ALLOW`:
 
-The daemon copies only these entitlements:
-
-- `com.apple.security.cs.allow-jit`
-- `com.apple.security.cs.allow-unsigned-executable-memory`
-- `com.apple.security.get-task-allow`
-
-`get-task-allow` is never copied merely because it exists on the source. The
-daemon must also be started with:
-
-```text
---allow-get-task-allow
+```bash
+SANDBOX_ENV_ALLOW='OPENAI_API_KEY=HASH,ANTHROPIC_API_KEY=HASH' sandbox/run.sh agent
 ```
 
-The launcher maps this from `SANDBOX_ALLOW_GET_TASK_ALLOW=1`. Without that
-explicit opt-in, rewritten binaries receive `get-task-allow=false`.
+A rule may contain comma-separated hashes for one variable:
 
-Invalid, unsigned, or unverifiable original signatures result in all three
-entitlements being false. Hardened runtime remains enabled in every successful
-macOS rewrite, and no `DYLD_INSERT_LIBRARIES` mechanism is used.
+```text
+OPENAI_API_KEY=HASH1,HASH2
+```
+
+When a sandboxed process calls `execve`, the embedded sandbox library asks the
+daemon whether the destination executable's exact bytes match an allowed hash
+for each environment variable. Every configured variable is retained only for
+matching binaries; otherwise its value is replaced with the empty string.
+The default is deny, and daemon communication failure is fail-closed.
+
+The hash is the lowercase SHA-256 digest of the executable file, before
+rewriting. This lets policy identify the intended original binary rather than a
+cache artifact. The daemon owns the comparison, so the process cannot change
+the decision locally.
+
+This mechanism protects variables across child-process exec boundaries. It does
+not protect a secret already present in a process's memory, command-line
+arguments, inherited file descriptors, or IPC channels. Keep the policy narrow
+and avoid granting an interpreter or shell hash.
+
+The daemon also always enables the hardened runtime for rewritten macOS
+binaries. Original JIT and unsigned-executable-memory entitlements are copied
+only after strict signature verification. `get-task-allow` additionally
+requires `--allow-get-task-allow` (or `SANDBOX_ALLOW_GET_TASK_ALLOW=1`).

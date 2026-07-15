@@ -10,8 +10,22 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <limits.h>
 
 extern char **environ;
+
+static bool env_visible(const char *path, const char *name) {
+    const char *socket_path = getenv("SANDBOX_DAEMON_SOCKET"); if (!socket_path) return false;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0); if (fd < 0) return false;
+    struct sockaddr_un a = {.sun_family = AF_UNIX}; snprintf(a.sun_path, sizeof(a.sun_path), "%s", socket_path);
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { close(fd); return false; }
+    dprintf(fd, "ENV %s %s\n", path, name); char b[32] = {0}; ssize_t n = read(fd, b, sizeof(b)-1); close(fd);
+    return n >= 5 && !strncmp(b, "ALLOW", 5);
+}
+static void redact_environment(const char *path, char *const envp[]) {
+    if (!getenv("SANDBOX_ENV_POLICY")) return;
+    for (char *const *p = envp; p && *p; p++) { char *eq = strchr(*p, '='); if (!eq) continue; char name[NAME_MAX]; size_t n=(size_t)(eq-*p); if(n>=sizeof(name))continue; memcpy(name,*p,n);name[n]='\0'; if(!env_visible(path,name)) memset(eq+1,0,strlen(eq+1)); }
+}
 /* Loaded by the daemon-rewritten Mach-O via LC_LOAD_DYLIB; no environment
    variable injection is used. */
 typedef int (*execve_fn)(const char *, char *const[], char *const[]);
@@ -43,6 +57,7 @@ static char *daemon_rewrite(const char *path) {
 
 int execve(const char *path, char *const argv[], char *const envp[]) {
     init_real();
+    redact_environment(path, envp);
     if (!real_execve || resolving) { errno = ENOSYS; return -1; }
     char *rewritten = daemon_rewrite(path);
     int result = real_execve(rewritten ? rewritten : path, argv, envp);
