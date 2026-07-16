@@ -262,10 +262,13 @@ func startTestProxy(t *testing.T, target *url.URL) (net.Listener, *[]string) {
 					}
 					defer destConn.Close()
 					fmt.Fprintf(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
+					if br.Buffered() > 0 {
+						io.CopyN(destConn, br, int64(br.Buffered()))
+					}
 					var wg sync.WaitGroup
 					wg.Add(2)
-					go func() { defer wg.Done(); io.Copy(destConn, conn) }()
-					go func() { defer wg.Done(); io.Copy(conn, destConn) }()
+					go func() { defer wg.Done(); io.Copy(destConn, conn); destConn.Close() }()
+					go func() { defer wg.Done(); io.Copy(conn, destConn); conn.Close() }()
 					wg.Wait()
 					return
 				}

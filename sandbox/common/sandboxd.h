@@ -1,0 +1,25 @@
+/* Common command strings and response codes for the sandbox daemon protocol. */
+#ifndef SANDBOX_COMMON_SANDBOXD_H
+#define SANDBOX_COMMON_SANDBOXD_H
+
+#define SANDBOXD_CMD_PING     "PING"
+#define SANDBOXD_CMD_REGISTER "REGISTER"
+#define SANDBOXD_CMD_FORK     "FORK"
+#define SANDBOXD_CMD_ENV      "ENV"
+#define SANDBOXD_CMD_OPEN     "OPEN"
+#define SANDBOXD_CMD_CONNECT  "CONNECT"
+#define SANDBOXD_CMD_KILL     "KILL"
+#define SANDBOXD_CMD_KILLALL  "KILLALL"
+#define SANDBOXD_CMD_LIST     "LIST"
+#define SANDBOXD_CMD_REWRITE  "REWRITE"
+
+#define SANDBOXD_RESP_OK      "OK"
+#define SANDBOXD_RESP_DENY    "DENY"
+#define SANDBOXD_RESP_ALLOWED "ALLOWED"
+#define SANDBOXD_RESP_UPDATED "UPDATED"
+#define SANDBOXD_RESP_RO      "RO"
+#define SANDBOXD_RESP_DENIED  "DENIED"
+
+#define SANDBOXD_MAX_LINE     4096
+
+#endif /* SANDBOX_COMMON_SANDBOXD_H */

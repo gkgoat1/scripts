@@ -233,14 +233,17 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientConn, _, err := w.(http.Hijacker).Hijack()
+	clientConn, brw, err := w.(http.Hijacker).Hijack()
 	if err != nil {
 		destConn.Close()
 		return
 	}
 	fmt.Fprintf(clientConn, "HTTP/1.1 200 Connection established\r\n\r\n")
-
-	s.wg.Add(2)
+	// The hijacker may have buffered bytes that the client already sent after
+	// the request line (e.g. pipelined TLS data); forward them first.
+	if brw != nil && brw.Reader.Buffered() > 0 {
+		io.CopyN(destConn, brw, int64(brw.Reader.Buffered()))
+	}
 
 	s.wg.Add(2)
 	doneA := make(chan struct{})
@@ -248,13 +251,12 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		defer s.wg.Done()
 		defer close(doneA)
 		io.Copy(destConn, clientConn)
-		destConn.SetReadDeadline(time.Now())
+		destConn.Close()
 	}()
 	go func() {
 		defer s.wg.Done()
 		io.Copy(clientConn, destConn)
 		clientConn.Close()
-		clientConn.SetReadDeadline(time.Now())
 		<-doneA
 	}()
 }
@@ -349,6 +351,27 @@ func (e proxyEnv) useProxy(hostport string) bool {
 
 func proxyForURL(target *url.URL) (*url.URL, error) {
 	return loadProxyEnv().proxyFor(target)
+}
+
+// ProxyForURL returns the upstream proxy URL, if any, that should handle
+// target. It is exported so other packages (e.g. sandboxd) can reuse the same
+// environment-variable logic.
+func ProxyForURL(target *url.URL) (*url.URL, error) {
+	return proxyForURL(target)
+}
+
+// DialHost dials host:port honoring HTTPS_PROXY, ALL_PROXY, and NO_PROXY. If
+// no proxy applies it dials directly. The host argument must already be in
+// host:port form.
+func DialHost(ctx context.Context, host string) (net.Conn, error) {
+	proxyURL, err := proxyForURL(&url.URL{Scheme: "https", Host: host})
+	if err != nil {
+		return nil, err
+	}
+	if proxyURL != nil {
+		return dialViaProxy(ctx, proxyURL, host)
+	}
+	return dialTCP(ctx, host)
 }
 
 func proxyAuthHeader(user *url.Userinfo) string {

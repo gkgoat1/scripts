@@ -4,8 +4,17 @@ root_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 build="$root_dir/.build"
 probe="$build/linux-probe"
 mkdir -p "$build"
-if [[ ! -x "$probe" || "$root_dir/linux/probe.c" -nt "$probe" ]]; then
-  cc -std=c11 -Wall -Wextra -O2 "$root_dir/linux/probe.c" -o "$probe"
+common_sources=("$root_dir/common/path.c" "$root_dir/common/message.c" "$root_dir/common/socket.c")
+rebuild=0
+if [[ ! -x "$probe" ]]; then
+  rebuild=1
+else
+  for f in "$root_dir/linux/probe.c" "${common_sources[@]}"; do
+    if [[ "$f" -nt "$probe" ]]; then rebuild=1; break; fi
+  done
+fi
+if [[ "$rebuild" == 1 ]]; then
+  cc -std=c11 -Wall -Wextra -O2 "$root_dir/linux/probe.c" "${common_sources[@]}" -o "$probe"
 fi
 root=$(mktemp -d "${TMPDIR:-/tmp}/sandbox-root.XXXXXX")
 cleanup(){ rm -rf -- "$root"; }

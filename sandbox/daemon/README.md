@@ -55,3 +55,33 @@ tracks `REGISTER`, `FORK`, `ENV`, and `OPEN` requests per PID.
 Rewritten macOS binaries continue to receive hardened runtime signing. Valid
 original JIT and unsigned-executable-memory entitlements are preserved;
 `get-task-allow` additionally requires the explicit daemon flag.
+
+## Hardened Runtime library validation
+
+Library validation remains enabled: the daemon never adds
+`com.apple.security.cs.disable-library-validation`, and it never uses
+`DYLD_INSERT_LIBRARIES`. On macOS, the wrapper requires a real, non-ad-hoc
+identity in `SANDBOX_CODESIGN_IDENTITY` (optionally
+`SANDBOX_CODESIGN_KEYCHAIN`). The wrapper signs the shim with that identity;
+the daemon signs each rewritten executable with the same identity and embeds a
+library load constraint matching the shim's Team ID and signing identifier.
+
+The rewritten executable and shim are staged together as `program` and `x`,
+and the load command is `@executable_path/x`. This makes the accepted library
+both identity-bound and path-scoped. A different signed library, an ad-hoc
+library, an unsigned library, or an injected library from an unrelated process
+fails Hardened Runtime validation. The identity must be a Developer ID,
+Apple-development, enterprise, or equivalent identity accepted by the target
+macOS; an arbitrary self-signed certificate is not a portable substitute.
+
+Example:
+
+```bash
+SANDBOX_CODESIGN_IDENTITY='Developer ID Application: Example, Inc. (TEAMID1234)' \
+SANDBOX_CODESIGN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db" \
+sandbox/run.sh /path/to/thin-arm64-program
+```
+
+The current implementation intentionally fails closed if the identity is
+missing, ad-hoc, or the shim has no Team ID. Existing cached rewrites are
+versioned by the signing identity and must not be reused across identities.

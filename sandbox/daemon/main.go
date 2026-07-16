@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/xml"
@@ -18,6 +20,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/gkgoat1/scripts/internal/proxypass"
 	"github.com/gkgoat1/scripts/interpose/policy/tcc"
 )
 
@@ -42,13 +45,13 @@ type process struct {
 	path, hash        string
 }
 type server struct {
-	socket, shim      string
-	allowGetTaskAllow bool
-	envVars           map[string]map[string]bool
-	hashUpdaters      map[string]map[string]bool
-	cacheSources      map[string]string
-	procs             map[int]process
-	mu                sync.Mutex
+	socket, shim, identity, keychain string
+	allowGetTaskAllow                bool
+	envVars                          map[string]map[string]bool
+	hashUpdaters                     map[string]map[string]bool
+	cacheSources                     map[string]string
+	procs                            map[int]process
+	mu                               sync.Mutex
 }
 
 type originalEntitlements struct{ jit, unsigned, task bool }
@@ -69,6 +72,16 @@ func main() {
 		case "--shim":
 			if i+1 < len(os.Args) {
 				s.shim = os.Args[i+1]
+				i++
+			}
+		case "--codesign-identity":
+			if i+1 < len(os.Args) {
+				s.identity = os.Args[i+1]
+				i++
+			}
+		case "--codesign-keychain":
+			if i+1 < len(os.Args) {
+				s.keychain = os.Args[i+1]
 				i++
 			}
 		case "--allow-get-task-allow":
@@ -129,6 +142,15 @@ func killGroup(p process) {
 	}
 	_ = syscall.Kill(p.pid, syscall.SIGKILL)
 }
+
+func sendFD(uc *net.UnixConn, status string, fd int) error {
+	var oob []byte
+	if fd >= 0 {
+		oob = syscall.UnixRights(fd)
+	}
+	_, _, err := uc.WriteMsgUnix([]byte(status+"\n"), oob, nil)
+	return err
+}
 func (s *server) handle(c net.Conn) {
 	defer c.Close()
 	r := bufio.NewReader(c)
@@ -154,7 +176,11 @@ func (s *server) command(c net.Conn, line string) {
 			fmt.Fprintln(c, "ERR register")
 			return
 		}
-		pid, _ := strconv.Atoi(f[1])
+		pid, err := peerPID(c)
+		if err != nil {
+			fmt.Fprintln(c, "ERR peerpid")
+			return
+		}
 		parent, _ := strconv.Atoi(f[2])
 		s.register(pid, parent, f[3])
 		fmt.Fprintln(c, "OK")
@@ -163,7 +189,11 @@ func (s *server) command(c net.Conn, line string) {
 			fmt.Fprintln(c, "ERR fork")
 			return
 		}
-		pid, _ := strconv.Atoi(f[1])
+		pid, err := peerPID(c)
+		if err != nil {
+			fmt.Fprintln(c, "ERR peerpid")
+			return
+		}
 		parent, _ := strconv.Atoi(f[2])
 		s.register(pid, parent, f[3])
 		fmt.Fprintln(c, "OK")
@@ -172,7 +202,11 @@ func (s *server) command(c net.Conn, line string) {
 			fmt.Fprintln(c, "DENY")
 			return
 		}
-		pid, _ := strconv.Atoi(f[1])
+		pid, err := peerPID(c)
+		if err != nil {
+			fmt.Fprintln(c, "DENY")
+			return
+		}
 		if s.envAllowed(pid, f[3]) {
 			fmt.Fprintln(c, "ALLOW")
 		} else {
@@ -183,7 +217,11 @@ func (s *server) command(c net.Conn, line string) {
 			fmt.Fprintln(c, policyDenied)
 			return
 		}
-		pid, _ := strconv.Atoi(f[1])
+		pid, err := peerPID(c)
+		if err != nil {
+			fmt.Fprintln(c, policyDenied)
+			return
+		}
 		flags := 0
 		if len(f) >= 4 {
 			flags, _ = strconv.Atoi(f[3])
@@ -203,6 +241,47 @@ func (s *server) command(c net.Conn, line string) {
 		} else {
 			fmt.Fprintln(c, policyAllowed)
 		}
+	case "CONNECT": // CONNECT pid host port
+		if len(f) < 4 {
+			fmt.Fprintln(c, "DENIED missing host/port")
+			return
+		}
+		uc, ok := c.(*net.UnixConn)
+		if !ok {
+			fmt.Fprintln(c, "DENIED not unix")
+			return
+		}
+		host := f[2]
+		port := f[3]
+		target := net.JoinHostPort(host, port)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*proxypass.DefaultDialTimeout)
+		defer cancel()
+		conn, err := proxypass.DialHost(ctx, target)
+		if err != nil {
+			fmt.Fprintf(c, "DENIED %s\n", err)
+			return
+		}
+		tcpConn, ok := conn.(*net.TCPConn)
+		if !ok {
+			conn.Close()
+			fmt.Fprintln(c, "DENIED non-tcp")
+			return
+		}
+		file, err := tcpConn.File()
+		if err != nil {
+			conn.Close()
+			fmt.Fprintf(c, "DENIED %s\n", err)
+			return
+		}
+		fd := int(file.Fd())
+		if err := sendFD(uc, "OK", fd); err != nil {
+			file.Close()
+			conn.Close()
+			fmt.Fprintf(c, "DENIED %s\n", err)
+			return
+		}
+		file.Close()
+		conn.Close()
 	case "REWRITE":
 		if len(f) < 2 {
 			fmt.Fprintln(c, "ERR rewrite")
@@ -215,16 +294,18 @@ func (s *server) command(c net.Conn, line string) {
 			fmt.Fprintf(c, "OK %s\n", p)
 		}
 	case "KILL":
-		if len(f) > 1 {
-			pid, _ := strconv.Atoi(f[1])
-			s.mu.Lock()
-			if p, ok := s.procs[pid]; ok {
-				killGroup(p)
-				delete(s.procs, pid)
-			}
-			s.mu.Unlock()
-			fmt.Fprintln(c, "OK")
+		pid, err := peerPID(c)
+		if err != nil {
+			fmt.Fprintln(c, "ERR peerpid")
+			return
 		}
+		s.mu.Lock()
+		if p, ok := s.procs[pid]; ok {
+			killGroup(p)
+			delete(s.procs, pid)
+		}
+		s.mu.Unlock()
+		fmt.Fprintln(c, "OK")
 	case "KILLALL":
 		s.mu.Lock()
 		for pid, p := range s.procs {
@@ -361,6 +442,8 @@ func (s *server) rewrite(src string) (string, error) {
 	h := sha256.New()
 	h.Write(in)
 	h.Write(shim)
+	h.Write([]byte("sandbox-rewrite-v2"))
+	h.Write([]byte(s.identity))
 	h.Write([]byte(fmt.Sprintf("%t%t%t", orig.jit, orig.unsigned, orig.task && s.allowGetTaskAllow)))
 	name := hex.EncodeToString(h.Sum(nil))
 	cache, e := os.UserCacheDir()
@@ -371,19 +454,33 @@ func (s *server) rewrite(src string) (string, error) {
 	if e = os.MkdirAll(dir, 0700); e != nil {
 		return "", e
 	}
-	out := filepath.Join(dir, name)
-	if st, x := os.Stat(out); x == nil && st.Mode()&0111 != 0 {
+	entryDir := filepath.Join(dir, name)
+	out := filepath.Join(entryDir, "program")
+	if st, x := os.Stat(out); x == nil && st.Mode()&0111 != 0 && signedArtifact(out) {
 		s.mu.Lock()
 		s.cacheSources[out] = src
 		s.mu.Unlock()
 		return out, nil
 	}
-	if e = rewriteMachO(in, out, s.shim); e != nil {
+	if e = os.MkdirAll(entryDir, 0700); e != nil {
+		return "", e
+	}
+	out = filepath.Join(entryDir, "program")
+	shimOut := filepath.Join(entryDir, "x")
+	if e = copyFile(s.shim, shimOut); e != nil {
+		return "", fmt.Errorf("stage signed sandbox dylib: %w", e)
+	}
+	_ = os.Chmod(shimOut, 0755)
+	if e = rewriteMachO(in, out, "@executable_path/x"); e != nil {
 		return "", e
 	}
 	_ = os.Chmod(out, 0755)
 	if _, x := os.Stat("/usr/bin/codesign"); x == nil {
-		if e = signHardened(out, dir, orig, s.allowGetTaskAllow); e != nil {
+		team, identifier, cdhash, err := signingInfo(shimOut)
+		if err != nil {
+			return "", err
+		}
+		if e = signHardened(out, dir, orig, s.allowGetTaskAllow, s.identity, s.keychain, team, identifier, cdhash); e != nil {
 			return "", e
 		}
 	}
@@ -435,17 +532,87 @@ func readOriginalEntitlements(path string) (originalEntitlements, error) {
 	}
 	return r, nil
 }
-func signHardened(path, dir string, o originalEntitlements, allow bool) error {
+func signHardened(path, dir string, o originalEntitlements, allow bool, identity, keychain, team, libraryIdentifier, libraryCDHash string) error {
+	if identity == "" {
+		return fmt.Errorf("sandbox requires SANDBOX_CODESIGN_IDENTITY or SANDBOX_ADHOC=1")
+	}
+	adhoc := identity == "-"
+	if adhoc && libraryCDHash == "" {
+		return fmt.Errorf("sandbox dylib has no SHA-256 code-directory hash")
+	}
+	if !adhoc && (team == "" || team == "not set") {
+		return fmt.Errorf("sandbox dylib has no TeamIdentifier; sign it with a real identity or select SANDBOX_ADHOC=1")
+	}
 	p := filepath.Join(dir, "entitlements.plist")
+	constraint := filepath.Join(dir, "library-constraint.plist")
 	t := o.task && allow
-	v := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>com.apple.security.cs.allow-jit</key><%s/><key>com.apple.security.cs.allow-unsigned-executable-memory</key><%s/><key>com.apple.security.get-task-allow</key><%s/></dict></plist>`, boolTag(o.jit), boolTag(o.unsigned), boolTag(t))
+	v := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>com.apple.security.cs.allow-jit</key><%s/><key>com.apple.security.cs.allow-unsigned-executable-memory</key><%s/><key>com.apple.security.get-task-allow</key><%s/>`, boolTag(o.jit), boolTag(o.unsigned), boolTag(t))
+	var c string
+	if adhoc {
+		decoded, err := hex.DecodeString(libraryCDHash)
+		if err != nil || len(decoded) != 20 {
+			return fmt.Errorf("invalid sandbox dylib SHA-256 code-directory hash")
+		}
+		v += `<key>com.apple.security.cs.disable-library-validation</key><true/>`
+		c = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>cdhash</key><data>%s</data></dict></plist>`, base64.StdEncoding.EncodeToString(decoded))
+	} else {
+		c = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>team-identifier</key><string>%s</string><key>signing-identifier</key><string>%s</string></dict></plist>`, xmlEscape(team), xmlEscape(libraryIdentifier))
+	}
+	v += `</dict></plist>`
 	if e := os.WriteFile(p, []byte(v), 0600); e != nil {
 		return e
 	}
-	if e := exec.Command("codesign", "--force", "--sign", "-", "--timestamp=none", "--options", "runtime", "--entitlements", p, path).Run(); e != nil {
-		return fmt.Errorf("hardened codesign: %w", e)
+	if e := os.WriteFile(constraint, []byte(c), 0600); e != nil {
+		return e
+	}
+	args := []string{"--force", "--sign", identity, "--timestamp=none", "--options", "runtime", "--entitlements", p, "--library-constraint", constraint, path}
+	if keychain != "" {
+		args = append([]string{"--keychain", keychain}, args...)
+	}
+	if e := exec.Command("codesign", args...).Run(); e != nil {
+		return fmt.Errorf("hardened codesign with library constraint: %w", e)
 	}
 	return nil
+}
+
+func signedArtifact(path string) bool {
+	return exec.Command("codesign", "--verify", "--strict", path).Run() == nil
+}
+
+func copyFile(src, dst string) error {
+	b, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, b, 0755)
+}
+
+func signingInfo(path string) (team, identifier, cdhash string, err error) {
+	out, err := exec.Command("codesign", "-dv", "--verbose=4", path).CombinedOutput()
+	if err != nil {
+		return "", "", "", fmt.Errorf("inspect sandbox dylib signature: %w", err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		switch {
+		case strings.HasPrefix(line, "TeamIdentifier="):
+			team = strings.TrimSpace(strings.TrimPrefix(line, "TeamIdentifier="))
+		case strings.HasPrefix(line, "Identifier="):
+			identifier = strings.TrimSpace(strings.TrimPrefix(line, "Identifier="))
+		case strings.HasPrefix(line, "CandidateCDHash sha256="):
+			cdhash = strings.TrimSpace(strings.TrimPrefix(line, "CandidateCDHash sha256="))
+		}
+	}
+	if identifier == "" {
+		return "", "", "", fmt.Errorf("sandbox dylib has no signing identifier")
+	}
+	if _, err := hex.DecodeString(cdhash); err != nil || len(cdhash) != 40 {
+		return "", "", "", fmt.Errorf("sandbox dylib has no usable SHA-256 code-directory hash")
+	}
+	return team, identifier, cdhash, nil
+}
+
+func xmlEscape(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "\"", "&quot;", "'", "&apos;").Replace(s)
 }
 func boolTag(v bool) string {
 	if v {
@@ -463,7 +630,11 @@ func rewriteMachO(in []byte, out, name string) error {
 	if old > uint64(len(in)) {
 		return fmt.Errorf("invalid load commands")
 	}
-	var first uint64
+	// Prefer replacing an optional command. If the replacement is larger, move
+	// only the load-command table into the existing zero padding before code;
+	// file offsets and the code-signature blob remain unchanged.
+	var anchorOff, anchorSize uint64
+	var anchorCount uint32
 	off := uint64(32)
 	for i := uint32(0); i < ncmd; i++ {
 		if off+8 > uint64(len(in)) {
@@ -473,31 +644,58 @@ func rewriteMachO(in []byte, out, name string) error {
 		if sz < 8 || off+sz > uint64(len(in)) {
 			return fmt.Errorf("invalid load command size")
 		}
-		if binary.LittleEndian.Uint32(in[off:]) == 0x19 && sz >= 48 && first == 0 {
-			first = binary.LittleEndian.Uint64(in[off+40:])
+		cmd := binary.LittleEndian.Uint32(in[off:])
+		if cmd == 0x29 && sz == 16 && i+1 < ncmd { // LC_DYLIB_CODE_SIGN_DRS + source
+			next := off + sz
+			nextSize := uint64(binary.LittleEndian.Uint32(in[next+4:]))
+			if binary.LittleEndian.Uint32(in[next:]) == 0x1d && nextSize == 16 {
+				anchorOff, anchorSize, anchorCount = off, 32, 2
+			}
+		}
+		if cmd == 0x1d && off+sz == old && anchorOff == 0 { // source only
+			anchorOff, anchorSize, anchorCount = off, sz, 1
 		}
 		off += sz
 	}
-	if first == 0 || first < old {
-		return fmt.Errorf("no safe load-command padding")
+	if anchorOff == 0 {
+		return fmt.Errorf("no replaceable load command for sandbox dylib")
 	}
 	n := uint64(len(name) + 1)
 	cs := (24 + n + 7) &^ 7
-	if first-old < cs {
-		return fmt.Errorf("no Mach-O load-command padding")
+	delta := int64(cs) - int64(anchorSize)
+	if delta > 0 {
+		if old+uint64(delta) > uint64(len(in)) {
+			return fmt.Errorf("no Mach-O load-command padding for sandbox dylib")
+		}
+		for j := old; j < old+uint64(delta); j++ {
+			if in[j] != 0 {
+				return fmt.Errorf("no replaceable load-command padding")
+			}
+		}
 	}
 	b := append([]byte(nil), in...)
-	for j := old; j < old+cs; j++ {
+	if delta > 0 {
+		// Move commands after the replaced command right, backwards to avoid
+		// overwriting them. The command-table end moves by delta.
+		for j := int64(old) - 1; j >= int64(anchorOff+anchorSize); j-- {
+			b[j+delta] = b[j]
+		}
+	} else if delta < 0 {
+		for j := anchorOff + anchorSize; j < old; j++ {
+			b[uint64(int64(j)+delta)] = b[j]
+		}
+	}
+	for j := anchorOff; j < anchorOff+cs; j++ {
 		b[j] = 0
 	}
-	binary.LittleEndian.PutUint32(b[old:], 0xc)
-	binary.LittleEndian.PutUint32(b[old+4:], uint32(cs))
-	binary.LittleEndian.PutUint32(b[old+8:], 24)
-	binary.LittleEndian.PutUint32(b[old+12:], 2)
-	binary.LittleEndian.PutUint32(b[old+16:], 0x10000)
-	binary.LittleEndian.PutUint32(b[old+20:], 0x10000)
-	copy(b[old+24:], name)
-	binary.LittleEndian.PutUint32(b[16:], ncmd+1)
-	binary.LittleEndian.PutUint32(b[20:], sizeof+uint32(cs))
+	binary.LittleEndian.PutUint32(b[anchorOff:], 0xc)
+	binary.LittleEndian.PutUint32(b[anchorOff+4:], uint32(cs))
+	binary.LittleEndian.PutUint32(b[anchorOff+8:], 24)
+	binary.LittleEndian.PutUint32(b[anchorOff+12:], 2)
+	binary.LittleEndian.PutUint32(b[anchorOff+16:], 0x10000)
+	binary.LittleEndian.PutUint32(b[anchorOff+20:], 0x10000)
+	copy(b[anchorOff+24:], name)
+	binary.LittleEndian.PutUint32(b[20:], uint32(int64(sizeof)+delta))
+	binary.LittleEndian.PutUint32(b[16:], ncmd-anchorCount+1)
 	return os.WriteFile(out, b, 0755)
 }
