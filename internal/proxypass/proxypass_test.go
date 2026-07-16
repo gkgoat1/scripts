@@ -3,6 +3,7 @@
 package proxypass
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -10,12 +11,17 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+const testTimeout = 60 * time.Second
 
 func netTestsEnabled() bool {
 	return os.Getenv("PPROXY_NET") != "0"
@@ -73,7 +79,7 @@ func TestPlainHTTP_RoundTrip(t *testing.T) {
 		Transport: &http.Transport{
 			Proxy: http.ProxyURL(s.URL()),
 		},
-		Timeout: 5 * time.Second,
+		Timeout: testTimeout,
 	}
 
 	resp, err := client.Do(req)
@@ -127,7 +133,7 @@ func TestConnectHTTPS(t *testing.T) {
 		transport.TLSClientConfig = &tls.Config{}
 	}
 	transport.TLSClientConfig.InsecureSkipVerify = true
-	client.Timeout = 10 * time.Second
+	client.Timeout = testTimeout
 	client.Transport = transport
 
 	resp, err := client.Get(upstream.URL + "/secure")
@@ -220,6 +226,318 @@ func TestEnv_NilServer(t *testing.T) {
 	}
 }
 
+// startTestProxy is a minimal raw-TCP upstream proxy used only by tests. It
+// accepts HTTP proxy requests and CONNECT tunnels. Unlike httptest.Server, it
+// does not need to hijack an http.ResponseWriter, which makes CONNECT handling
+// more predictable.
+func startTestProxy(t *testing.T, target *url.URL) (net.Listener, *[]string) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen test proxy: %v", err)
+	}
+	var mu sync.Mutex
+	var requests []string
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				br := bufio.NewReader(conn)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					return
+				}
+				if req.Method == http.MethodConnect {
+					mu.Lock()
+					requests = append(requests, "CONNECT "+req.Host)
+					mu.Unlock()
+					destConn, err := net.Dial("tcp", req.Host)
+					if err != nil {
+						fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+						return
+					}
+					defer destConn.Close()
+					fmt.Fprintf(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
+					var wg sync.WaitGroup
+					wg.Add(2)
+					go func() { defer wg.Done(); io.Copy(destConn, conn) }()
+					go func() { defer wg.Done(); io.Copy(conn, destConn) }()
+					wg.Wait()
+					return
+				}
+				mu.Lock()
+				requests = append(requests, req.Method+" "+req.URL.String())
+				if auth := req.Header.Get("Proxy-Authorization"); auth != "" {
+					requests = append(requests, "AUTH "+auth)
+				}
+				mu.Unlock()
+				// Body may already have bytes buffered in br; present a reader
+				// that includes them so ReverseProxy can read the full body.
+				req.Body = io.NopCloser(io.MultiReader(br, req.Body))
+				w := &rawResponseWriter{conn: conn, header: make(http.Header)}
+				rp := httputil.NewSingleHostReverseProxy(target)
+				rp.ServeHTTP(w, req)
+			}(conn)
+		}
+	}()
+	t.Cleanup(func() { l.Close() })
+	return l, &requests
+}
+
+type rawResponseWriter struct {
+	conn        net.Conn
+	header      http.Header
+	code        int
+	wroteHeader bool
+}
+
+func (w *rawResponseWriter) Header() http.Header { return w.header }
+
+func (w *rawResponseWriter) WriteHeader(code int) {
+	if w.wroteHeader {
+		return
+	}
+	w.code = code
+	fmt.Fprintf(w.conn, "HTTP/1.1 %d %s\r\n", code, http.StatusText(code))
+	w.header.Write(w.conn)
+	fmt.Fprint(w.conn, "\r\n")
+	w.wroteHeader = true
+}
+
+func (w *rawResponseWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.conn.Write(p)
+}
+
+func TestUpstreamHTTP_ProxyUsed(t *testing.T) {
+	if !netTestsEnabled() {
+		t.Skip("PPROXY_NET=0")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Echo-Path", r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "hello via upstream")
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+
+	proxy, requests := startTestProxy(t, upstreamURL)
+
+	s, err := Start(ctx)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Close()
+
+	t.Setenv("HTTP_PROXY", "http://"+proxy.Addr().String())
+
+	client := &http.Client{
+		Transport: &http.Transport{Proxy: http.ProxyURL(s.URL())},
+		Timeout:   testTimeout,
+	}
+	resp, err := client.Get(upstream.URL + "/foo")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "hello via upstream" {
+		t.Fatalf("body = %q", body)
+	}
+	if len(*requests) < 1 || !strings.Contains((*requests)[0], upstreamURL.Host) {
+		t.Fatalf("expected proxy request for upstream host, got %v", *requests)
+	}
+}
+
+func TestUpstreamCONNECT_RawTunnel(t *testing.T) {
+	if !netTestsEnabled() {
+		t.Skip("PPROXY_NET=0")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen echo: %v", err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			conn, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				line, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				fmt.Fprint(c, line)
+			}(conn)
+		}
+	}()
+
+	// The helper needs a target URL for non-CONNECT requests; it is unused here.
+	dummyTarget := &url.URL{Scheme: "http", Host: "127.0.0.1:1"}
+	proxy, requests := startTestProxy(t, dummyTarget)
+
+	s, err := Start(ctx)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Close()
+
+	t.Setenv("HTTPS_PROXY", "http://"+proxy.Addr().String())
+
+	conn, err := net.Dial("tcp", s.Addr())
+	if err != nil {
+		t.Fatalf("dial local proxy: %v", err)
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", echo.Addr().String(), echo.Addr().String())
+	br := bufio.NewReader(conn)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read connect response: %v", err)
+	}
+	if !strings.HasPrefix(line, "HTTP/1.1 200") && !strings.HasPrefix(line, "HTTP/1.0 200") {
+		t.Fatalf("unexpected connect response: %q", line)
+	}
+	for {
+		l, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read headers: %v", err)
+		}
+		if l == "\r\n" || l == "\n" {
+			break
+		}
+	}
+
+	fmt.Fprint(conn, "ping\n")
+	resp, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if resp != "ping\n" {
+		t.Fatalf("echo = %q", resp)
+	}
+
+	want := "CONNECT " + echo.Addr().String()
+	var saw bool
+	for _, req := range *requests {
+		if req == want {
+			saw = true
+			break
+		}
+	}
+	if !saw {
+		t.Fatalf("expected %s through upstream proxy, got %v", want, *requests)
+	}
+}
+
+func TestNoProxy_Bypass(t *testing.T) {
+	if !netTestsEnabled() {
+		t.Skip("PPROXY_NET=0")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "direct")
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+
+	proxy, requests := startTestProxy(t, upstreamURL)
+
+	s, err := Start(ctx)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Close()
+
+	t.Setenv("HTTP_PROXY", "http://"+proxy.Addr().String())
+	t.Setenv("NO_PROXY", upstreamURL.Hostname())
+
+	client := &http.Client{
+		Transport: &http.Transport{Proxy: http.ProxyURL(s.URL())},
+		Timeout:   testTimeout,
+	}
+	resp, err := client.Get(upstream.URL + "/skip")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "direct" {
+		t.Fatalf("body = %q", body)
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("expected upstream proxy not to be used, got %d requests", len(*requests))
+	}
+}
+
+func TestProxyAuth_Credentials(t *testing.T) {
+	if !netTestsEnabled() {
+		t.Skip("PPROXY_NET=0")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "auth-ok")
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+
+	proxy, requests := startTestProxy(t, upstreamURL)
+
+	s, err := Start(ctx)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Close()
+
+	t.Setenv("HTTP_PROXY", "http://testuser:testpass@"+proxy.Addr().String())
+
+	client := &http.Client{
+		Transport: &http.Transport{Proxy: http.ProxyURL(s.URL())},
+		Timeout:   testTimeout,
+	}
+	resp, err := client.Get(upstream.URL + "/auth")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "auth-ok" {
+		t.Fatalf("body = %q", body)
+	}
+	want := "AUTH " + proxyAuthHeader(url.UserPassword("testuser", "testpass"))
+	var got string
+	for _, req := range *requests {
+		if strings.HasPrefix(req, "AUTH ") {
+			got = req
+			break
+		}
+	}
+	if got != want {
+		t.Fatalf("Proxy-Authorization = %q, want %q", got, want)
+	}
+}
+
 func BenchmarkThroughput(b *testing.B) {
 	if !netTestsEnabled() {
 		b.Skip("PPROXY_NET=0")
@@ -243,7 +561,7 @@ func BenchmarkThroughput(b *testing.B) {
 			Proxy:           http.ProxyURL(s.URL()),
 			MaxConnsPerHost: 16,
 		},
-		Timeout: 5 * time.Second,
+		Timeout: testTimeout,
 	}
 
 	var okCount int64

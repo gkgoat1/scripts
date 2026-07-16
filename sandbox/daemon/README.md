@@ -13,10 +13,29 @@ are returned as an empty string. This means an authorized nested agent can
 continue to use a key while an intermediate spawner cannot read it. A daemon
 failure is fail-closed for configured variables.
 
-## Interpreter/code hash updates
+## File access policy
 
-Interpreters can be authorized to change the process identity hash when they
-open a script or bytecode file:
+`OPEN pid path flags` is the daemon's central file-access decision point. The
+daemon imports `interpose/policy/tcc` for TCC-sensitive paths and augments it
+with a default dotfile deny list:
+
+- Access to TCC-protected directories (`Documents`, `Desktop`, `Downloads`,
+  `Library`, `Pictures`, `Movies`, `Music`, and any configured
+  `extra-protected-path`) is denied.
+- All dotfiles are denied except shell startup files (`.zshrc`, `.bashrc`,
+  `.profile`, `.bash_profile`, `.zprofile`, `.zlogin`), which are allowed
+  read-only.
+
+Response codes:
+
+- `DENIED` — the open/exec is blocked.
+- `RO` — the path is allowed read-only; if `flags` contain a write mode,
+  the request becomes `DENIED`.
+- `ALLOWED` — the path is allowed; no interpreter hash update occurred.
+- `UPDATED` — the path is allowed and the process identity hash was updated
+  (interpreter/code hash update policy).
+
+## Interpreter/code hash updates
 
 ```bash
 SANDBOX_HASH_UPDATERS='INTERPRETER_HASH=.py,.js,.wasm' sandbox/run.sh python

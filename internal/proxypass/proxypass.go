@@ -7,12 +7,15 @@ package proxypass
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -119,12 +122,25 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	destConn, err := dialTCP(r.Context(), r.URL.Host)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
+	var destConn net.Conn
+	proxyURL, _ := proxyForURL(r.URL)
+	if proxyURL != nil {
+		var err error
+		destConn, err = dialTCP(r.Context(), proxyURL.Host)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer destConn.Close()
+	} else {
+		var err error
+		destConn, err = dialTCP(r.Context(), r.URL.Host)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer destConn.Close()
 	}
-	defer destConn.Close()
 
 	// Build an outbound request we can canonicalize. We don't actually use
 	// Go's HTTP client here because we want to keep raw byte streaming and
@@ -158,12 +174,20 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// When forwarding through an upstream proxy use the full URL and add
+	// credentials from the proxy URL.
+	if proxyURL != nil {
+		if user := proxyURL.User; user != nil {
+			outReq.Header.Set("Proxy-Authorization", proxyAuthHeader(user))
+		}
+	}
+
 	// Apply connection hop-by-hop handling: close after this single transaction
 	// so the simple ReadResponse path stays in sync. Long-lived proxy
 	// connections use CONNECT tunneling anyway.
 	outReq.Header.Set("Connection", "close")
 
-	if err := outReq.Write(destConn); err != nil {
+	if err := writeRequest(destConn, outReq, proxyURL != nil); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -185,22 +209,38 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
+func writeRequest(conn net.Conn, req *http.Request, useProxy bool) error {
+	if useProxy {
+		return req.WriteProxy(conn)
+	}
+	return req.Write(conn)
+}
+
 // handleConnect handles HTTPS proxy CONNECT tunneling.
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
-	destConn, err := dialTCP(r.Context(), r.Host)
+	target := &url.URL{Scheme: "https", Host: r.Host}
+	proxyURL, _ := proxyForURL(target)
+
+	var destConn net.Conn
+	var err error
+	if proxyURL != nil {
+		destConn, err = dialViaProxy(r.Context(), proxyURL, r.Host)
+	} else {
+		destConn, err = dialTCP(r.Context(), r.Host)
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-
 	clientConn, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
 		destConn.Close()
-		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	fmt.Fprintf(clientConn, "HTTP/1.1 200 Connection established\r\n\r\n")
+
+	s.wg.Add(2)
 
 	s.wg.Add(2)
 	doneA := make(chan struct{})
@@ -217,6 +257,187 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		clientConn.SetReadDeadline(time.Now())
 		<-doneA
 	}()
+}
+
+// proxyEnv holds the current values of the environment variables that
+// control upstream proxy selection. Values are read on each request, not
+// cached, so callers can change them during process startup.
+type proxyEnv struct {
+	HTTPProxy  string
+	HTTPSProxy string
+	AllProxy   string
+	NoProxy    string
+}
+
+func loadProxyEnv() proxyEnv {
+	return proxyEnv{
+		HTTPProxy:  envVal("HTTP_PROXY", "http_proxy"),
+		HTTPSProxy: envVal("HTTPS_PROXY", "https_proxy"),
+		AllProxy:   envVal("ALL_PROXY", "all_proxy"),
+		NoProxy:    envVal("NO_PROXY", "no_proxy"),
+	}
+}
+
+func envVal(upper, lower string) string {
+	if v := os.Getenv(upper); v != "" {
+		return v
+	}
+	return os.Getenv(lower)
+}
+
+func (e proxyEnv) proxyFor(target *url.URL) (*url.URL, error) {
+	if target == nil || target.Host == "" {
+		return nil, nil
+	}
+	var raw string
+	switch target.Scheme {
+	case "https":
+		raw = e.HTTPSProxy
+		if raw == "" {
+			raw = e.AllProxy
+		}
+		if raw == "" {
+			raw = e.HTTPProxy
+		}
+	case "http":
+		raw = e.HTTPProxy
+		if raw == "" {
+			raw = e.AllProxy
+		}
+	default:
+		raw = e.AllProxy
+	}
+	if raw == "" {
+		return nil, nil
+	}
+	if !e.useProxy(target.Host) {
+		return nil, nil
+	}
+	proxyURL, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	return proxyURL, nil
+}
+
+func (e proxyEnv) useProxy(hostport string) bool {
+	if e.NoProxy == "" {
+		return true
+	}
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	for _, p := range strings.Split(e.NoProxy, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if p == "*" {
+			return false
+		}
+		if strings.HasPrefix(p, ".") {
+			if strings.EqualFold(host, p[1:]) || strings.HasSuffix(strings.ToLower(host), strings.ToLower(p)) {
+				return false
+			}
+		} else if strings.EqualFold(host, p) {
+			return false
+		}
+	}
+	return true
+}
+
+func proxyForURL(target *url.URL) (*url.URL, error) {
+	return loadProxyEnv().proxyFor(target)
+}
+
+func proxyAuthHeader(user *url.Userinfo) string {
+	password, _ := user.Password()
+	creds := user.Username() + ":" + password
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
+}
+
+// dialViaProxy opens a TCP connection to proxyURL and requests a CONNECT
+// tunnel to targetHost. The returned connection is ready for end-to-end byte
+// streaming.
+func dialViaProxy(ctx context.Context, proxyURL *url.URL, targetHost string) (net.Conn, error) {
+	conn, err := dialTCP(ctx, proxyURL.Host)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := writeConnectRequest(conn, proxyURL, targetHost); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	if err := readConnectResponse(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	conn.SetReadDeadline(time.Time{})
+	return conn, nil
+}
+
+func writeConnectRequest(conn net.Conn, proxyURL *url.URL, targetHost string) error {
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", targetHost, targetHost); err != nil {
+		return err
+	}
+	if user := proxyURL.User; user != nil {
+		if _, err := fmt.Fprintf(conn, "Proxy-Authorization: %s\r\n", proxyAuthHeader(user)); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprint(conn, "\r\n")
+	return err
+}
+
+func readConnectResponse(conn net.Conn) error {
+	status, err := readLineTrim(conn)
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(status, "HTTP/1.1 200") && !strings.HasPrefix(status, "HTTP/1.0 200") {
+		return fmt.Errorf("proxy connect failed: %s", status)
+	}
+	for {
+		line, err := readLineTrim(conn)
+		if err != nil {
+			return err
+		}
+		if line == "" {
+			break
+		}
+	}
+	return nil
+}
+
+func readLineTrim(conn net.Conn) (string, error) {
+	line, err := readLine(conn)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+func readLine(conn net.Conn) (string, error) {
+	var b []byte
+	buf := make([]byte, 1)
+	for {
+		conn.SetReadDeadline(time.Now().Add(DefaultDialTimeout))
+		n, err := conn.Read(buf)
+		if err != nil {
+			return "", err
+		}
+		if n == 0 {
+			continue
+		}
+		b = append(b, buf[0])
+		if buf[0] == '\n' {
+			break
+		}
+	}
+	return string(b), nil
 }
 
 // dialTCP attempts to establish a TCP connection with a short, bounded timeout

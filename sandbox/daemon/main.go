@@ -17,7 +17,25 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"github.com/gkgoat1/scripts/interpose/policy/tcc"
 )
+
+const (
+	policyAllowed = "ALLOWED"
+	policyUpdated = "UPDATED"
+	policyRO      = "RO"
+	policyDenied  = "DENIED"
+)
+
+var shellConfigs = map[string]bool{
+	".zshrc":        true,
+	".bashrc":       true,
+	".profile":      true,
+	".bash_profile": true,
+	".zprofile":     true,
+	".zlogin":       true,
+}
 
 type process struct {
 	pid, parent, pgid int
@@ -160,16 +178,30 @@ func (s *server) command(c net.Conn, line string) {
 		} else {
 			fmt.Fprintln(c, "DENY")
 		}
-	case "OPEN": // OPEN pid path extension-filtered code update
+	case "OPEN": // OPEN pid path flags
 		if len(f) < 3 {
-			fmt.Fprintln(c, "DENY")
+			fmt.Fprintln(c, policyDenied)
 			return
 		}
 		pid, _ := strconv.Atoi(f[1])
+		flags := 0
+		if len(f) >= 4 {
+			flags, _ = strconv.Atoi(f[3])
+		}
+		switch s.pathPolicy(f[2]) {
+		case policyDenied:
+			fmt.Fprintln(c, policyDenied)
+			return
+		case policyRO:
+			if flags&(syscall.O_WRONLY|syscall.O_RDWR|syscall.O_APPEND|syscall.O_CREAT|syscall.O_TRUNC) != 0 {
+				fmt.Fprintln(c, policyDenied)
+				return
+			}
+		}
 		if s.updateHash(pid, f[2]) {
-			fmt.Fprintln(c, "UPDATED")
+			fmt.Fprintln(c, policyUpdated)
 		} else {
-			fmt.Fprintln(c, "IGNORED")
+			fmt.Fprintln(c, policyAllowed)
 		}
 	case "REWRITE":
 		if len(f) < 2 {
@@ -289,6 +321,28 @@ func (s *server) updateHash(pid int, path string) bool {
 	p.path = path
 	s.procs[pid] = p
 	return true
+}
+
+func (s *server) pathPolicy(path string) string {
+	norm, err := tcc.NormalizePath(path)
+	if err != nil {
+		return policyDenied
+	}
+	if tcc.IsProtected(norm) {
+		return policyDenied
+	}
+	dir := filepath.Dir(norm)
+	base := filepath.Base(norm)
+	for _, part := range []string{dir, base} {
+		name := filepath.Base(part)
+		if len(name) > 1 && name[0] == '.' && name != "." && name != ".." {
+			if shellConfigs[name] {
+				return policyRO
+			}
+			return policyDenied
+		}
+	}
+	return policyAllowed
 }
 
 func (s *server) rewrite(src string) (string, error) {

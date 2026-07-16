@@ -1,4 +1,4 @@
-.PHONY: test test-go test-shell coverage build-interpose build-pulse
+.PHONY: test test-go test-shell coverage build-interpose build-pulse fmt fmt-check
 
 test: test-go test-shell
 
@@ -20,3 +20,9 @@ build-interpose:
 
 build-pulse:
 	go build -o bin/pulse ./pulse
+
+fmt:
+	./sandbox/format-c.sh
+
+fmt-check:
+	./sandbox/format-c.sh --dry-run
