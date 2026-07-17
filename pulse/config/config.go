@@ -1,4 +1,9 @@
-package main
+// Package config parses pulse's job config file. It is split out from
+// pulse's main package (mirroring interpose/config's split from
+// interpose/main.go) so other tools — notably agentcommit — can parse the
+// exact same job definitions pulse itself will later run, without importing
+// a `package main`.
+package config
 
 import (
 	"bufio"
@@ -123,7 +128,7 @@ func LoadConfig(path string) ([]Job, error) {
 	return jobs, nil
 }
 
-// defaultConfigPath returns ~/.config/pulse/jobs.
-func defaultConfigPath() string {
+// DefaultConfigPath returns ~/.config/pulse/jobs.
+func DefaultConfigPath() string {
 	return filepath.Join(os.Getenv("HOME"), ".config", "pulse", "jobs")
 }

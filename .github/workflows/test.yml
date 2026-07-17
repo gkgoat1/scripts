@@ -31,6 +31,6 @@ jobs:
         run: brew install bats-core shellcheck
       - name: shellcheck git scripts
         continue-on-error: true
-        run: shellcheck git/*.sh installer/*.sh install-interposers.sh install-pulse.sh || true
+        run: shellcheck git/*.sh installer/*.sh install-interposers.sh install-pulse.sh install-agentcommit-anchor.sh || true
       - name: bats tests
         run: bats git/tests/ installer/tests/

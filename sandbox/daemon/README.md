@@ -26,6 +26,24 @@ with a default dotfile deny list:
   `.profile`, `.bash_profile`, `.zprofile`, `.zlogin`), which are allowed
   read-only.
 
+### Policy commitment verification
+
+`ExtraProtectedPaths` and `DisableSnapshot` (from `~/.config/interpose/config`,
+shared with `interpose`) are silently-editable config: anyone who can write
+that file can narrow the deny-list before the daemon starts. At startup,
+`main()` calls `verifyPolicy` (see `policy_verify.go`) to check the config's
+current policy leaf against a Merkle root anchored in the
+`agentcommit-anchor` LaunchAgent's plist (`commitment`/`commitment/anchor`;
+see `docs/agentcommit.md` for the full design). If the anchor was never
+installed, behavior is unchanged (live, unverified config, same as before
+this existed). If it's installed but the config's commitment doesn't verify
+— tampered, or never (re)committed — `s.protectedRoots` falls back to the
+fixed built-in roots only (`tcc.DefaultProtectedRoots()`), logging a
+`[warn]` line; `ExtraProtectedPaths` is dropped, never trusted unverified.
+This can never be more permissive than running with no config at all, so a
+tampered/stale commitment degrades protection back to the no-config
+baseline rather than failing the daemon closed entirely.
+
 Response codes:
 
 - `DENIED` — the open/exec is blocked.

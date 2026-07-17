@@ -19,11 +19,15 @@ type Job struct {
 func ParseConfig(r io.Reader) ([]Job, error)
 func LoadConfig(path string) ([]Job, error)
 
-type CommandRunner interface{ Run(shellCmd string) (exitCode int, err error) }
-type LoadChecker  interface{ Load1() (float64, error) }
-type Ticker       interface{ C() <-chan time.Time; Stop() }
+type CommandRunner      interface{ Run(shellCmd string) (exitCode int, err error) }
+type LoadChecker        interface{ Load1() (float64, error) }
+type Ticker             interface{ C() <-chan time.Time; Stop() }
+type CommitmentVerifier interface{ Verify(job Job) (ok bool, reason string, err error) }
 
-type Scheduler struct { /* ... */ }
+type Scheduler struct {
+    // ...
+    Verifier CommitmentVerifier // nil = commitment verification disabled
+}
 func NewScheduler(runner CommandRunner, loadCheck LoadChecker, newTicker func(time.Duration) Ticker, out, err io.Writer) *Scheduler
 func (s *Scheduler) Run(ctx context.Context, jobs []Job)
 ```
@@ -62,6 +66,14 @@ max-load1: 4.0
   `HTTP_PROXY`, `HTTPS_PROXY`, and merged `NO_PROXY`) into every job shell. The proxy binds
   only to `127.0.0.1`, forwards traffic without inspecting it, and stops when `pulse` exits.
   This lets an existing firewall intercept child traffic separately from `pulse`'s own traffic.
+- **Commitment verification** (see `docs/agentcommit.md`): `pulse` always checks each job's
+  `Command` against a Merkle commitment anchored in the `agentcommit-anchor` LaunchAgent's plist,
+  before running it, every tick — no flag needed. If that anchor was never installed
+  (`./install-agentcommit-anchor.sh` was never run), this is a complete no-op: jobs run exactly as
+  described above. Once adopted, a job whose live `Command` doesn't match its last-committed
+  value is skipped and logged (`[error] <job>: commitment verification failed ..., skipping`);
+  other jobs are unaffected. This guards against `~/.config/pulse/jobs` being edited by something
+  other than an operator running `agentcommit commit` themselves.
 
 ## Install
 

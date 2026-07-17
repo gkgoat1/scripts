@@ -17,6 +17,11 @@ type Config struct {
 
 var loaded *Config
 
+// DefaultConfigPath returns ~/.config/interpose/config.
+func DefaultConfigPath() string {
+	return filepath.Join(os.Getenv("HOME"), ".config", "interpose", "config")
+}
+
 // Load reads ~/.config/interpose/config (simple key: value lines).
 func Load() Config {
 	if loaded != nil {
@@ -25,7 +30,7 @@ func Load() Config {
 	cfg := Config{
 		SnapshotPrefix: "interpose/snapshot",
 	}
-	path := filepath.Join(os.Getenv("HOME"), ".config", "interpose", "config")
+	path := DefaultConfigPath()
 	f, err := os.Open(path)
 	if err != nil {
 		loaded = &cfg

@@ -80,6 +80,10 @@ disable-snapshot: /path/to/repo/root
 snapshot-prefix: interpose/snapshot
 ```
 
+`extra-protected-path`/`disable-snapshot` are also read by `sandboxd` (see
+`sandbox/daemon/README.md`'s "Policy commitment verification"), which optionally verifies this
+config against a Merkle commitment before trusting it — see `docs/agentcommit.md`.
+
 ## Adding a new wrapper
 
 1. Implement `core.Wrapper` in `interpose/wrappers/`.

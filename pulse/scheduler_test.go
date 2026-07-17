@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	pconfig "github.com/gkgoat1/scripts/pulse/config"
 )
 
 type fakeTicker struct {
@@ -60,6 +62,19 @@ type fakeLoadChecker struct {
 
 func (f fakeLoadChecker) Load1() (float64, error) { return f.load, f.err }
 
+// fakeVerifier reports ok for every job name in reject; every other job
+// name is treated as verified.
+type fakeVerifier struct {
+	reject map[string]bool
+}
+
+func (f fakeVerifier) Verify(job pconfig.Job) (bool, string, error) {
+	if f.reject[job.Name] {
+		return false, "tampered (fake)", nil
+	}
+	return true, "", nil
+}
+
 func newTestScheduler(runner CommandRunner, loadCheck LoadChecker, newTicker func(time.Duration) Ticker) (*Scheduler, *bytes.Buffer, *bytes.Buffer) {
 	var out, errBuf bytes.Buffer
 	return NewScheduler(runner, loadCheck, newTicker, &out, &errBuf), &out, &errBuf
@@ -68,7 +83,7 @@ func newTestScheduler(runner CommandRunner, loadCheck LoadChecker, newTicker fun
 func TestFireNoLoadGateRuns(t *testing.T) {
 	runner := &fakeRunner{code: 0}
 	sched, out, _ := newTestScheduler(runner, nil, nil)
-	job := Job{Name: "j", Interval: time.Second, Command: "echo hi"}
+	job := pconfig.Job{Name: "j", Interval: time.Second, Command: "echo hi"}
 
 	sched.fire(job)
 
@@ -84,7 +99,7 @@ func TestFireLoadUnderCeilingRuns(t *testing.T) {
 	runner := &fakeRunner{code: 0}
 	max := 4.0
 	sched, _, _ := newTestScheduler(runner, fakeLoadChecker{load: 1.0}, nil)
-	job := Job{Name: "j", Interval: time.Second, Command: "echo hi", MaxLoad1: &max}
+	job := pconfig.Job{Name: "j", Interval: time.Second, Command: "echo hi", MaxLoad1: &max}
 
 	sched.fire(job)
 
@@ -97,7 +112,7 @@ func TestFireLoadOverCeilingSkips(t *testing.T) {
 	runner := &fakeRunner{code: 0}
 	max := 1.0
 	sched, out, _ := newTestScheduler(runner, fakeLoadChecker{load: 5.0}, nil)
-	job := Job{Name: "j", Interval: time.Second, Command: "echo hi", MaxLoad1: &max}
+	job := pconfig.Job{Name: "j", Interval: time.Second, Command: "echo hi", MaxLoad1: &max}
 
 	sched.fire(job)
 
@@ -114,7 +129,7 @@ func TestFireLoadCheckErrorSkips(t *testing.T) {
 	max := 1.0
 	loadErr := errFake("sysctl broke")
 	sched, _, errBuf := newTestScheduler(runner, fakeLoadChecker{err: loadErr}, nil)
-	job := Job{Name: "j", Interval: time.Second, Command: "echo hi", MaxLoad1: &max}
+	job := pconfig.Job{Name: "j", Interval: time.Second, Command: "echo hi", MaxLoad1: &max}
 
 	sched.fire(job)
 
@@ -129,7 +144,7 @@ func TestFireLoadCheckErrorSkips(t *testing.T) {
 func TestFireNonzeroExitIsNotLoggedAsError(t *testing.T) {
 	runner := &fakeRunner{code: 1}
 	sched, out, errBuf := newTestScheduler(runner, nil, nil)
-	job := Job{Name: "j", Interval: time.Second, Command: "false"}
+	job := pconfig.Job{Name: "j", Interval: time.Second, Command: "false"}
 
 	sched.fire(job)
 
@@ -145,11 +160,100 @@ func TestFireRunnerErrorLogsToStderr(t *testing.T) {
 	runErr := errFake("exec failed")
 	runner := &fakeRunner{err: runErr}
 	sched, _, errBuf := newTestScheduler(runner, nil, nil)
-	job := Job{Name: "j", Interval: time.Second, Command: "echo hi"}
+	job := pconfig.Job{Name: "j", Interval: time.Second, Command: "echo hi"}
 
 	sched.fire(job)
 
 	if !strings.Contains(errBuf.String(), "[error] j:") {
+		t.Errorf("errBuf = %q", errBuf.String())
+	}
+}
+
+func TestFireNilVerifierIsUnrestricted(t *testing.T) {
+	runner := &fakeRunner{code: 0}
+	sched, _, _ := newTestScheduler(runner, nil, nil)
+	// sched.Verifier is left at its zero value (nil) — regression guard that
+	// this is a no-op change to existing pre-commitment behavior.
+	job := pconfig.Job{Name: "j", Interval: time.Second, Command: "echo hi"}
+
+	sched.fire(job)
+
+	if runner.callCount() != 1 {
+		t.Fatalf("callCount = %d, want 1 (nil Verifier must not block anything)", runner.callCount())
+	}
+}
+
+func TestFireVerifiedJobRuns(t *testing.T) {
+	runner := &fakeRunner{code: 0}
+	sched, _, errBuf := newTestScheduler(runner, nil, nil)
+	sched.Verifier = fakeVerifier{}
+	job := pconfig.Job{Name: "j", Interval: time.Second, Command: "echo hi"}
+
+	sched.fire(job)
+
+	if runner.callCount() != 1 {
+		t.Fatalf("callCount = %d, want 1", runner.callCount())
+	}
+	if errBuf.Len() != 0 {
+		t.Errorf("errBuf = %q, want empty for a verified job", errBuf.String())
+	}
+}
+
+func TestFireUnverifiedJobIsSkippedAndLogged(t *testing.T) {
+	runner := &fakeRunner{code: 0}
+	sched, _, errBuf := newTestScheduler(runner, nil, nil)
+	sched.Verifier = fakeVerifier{reject: map[string]bool{"j": true}}
+	job := pconfig.Job{Name: "j", Interval: time.Second, Command: "echo hi"}
+
+	sched.fire(job)
+
+	if runner.callCount() != 0 {
+		t.Fatalf("callCount = %d, want 0 (unverified job must not run)", runner.callCount())
+	}
+	if !strings.Contains(errBuf.String(), "[error] j: commitment verification failed") {
+		t.Errorf("errBuf = %q", errBuf.String())
+	}
+}
+
+func TestFireUnverifiedJobDoesNotAffectOtherJobs(t *testing.T) {
+	tickerA := newFakeTicker()
+	tickerB := newFakeTicker()
+	runner := &fakeRunner{code: 0}
+	newTicker := func(d time.Duration) Ticker {
+		switch d {
+		case time.Second:
+			return tickerA
+		case 2 * time.Second:
+			return tickerB
+		default:
+			t.Fatalf("unexpected interval %v", d)
+			return nil
+		}
+	}
+	sched, _, errBuf := newTestScheduler(runner, nil, newTicker)
+	sched.Verifier = fakeVerifier{reject: map[string]bool{"bad": true}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		sched.Run(ctx, []pconfig.Job{
+			{Name: "bad", Interval: time.Second, Command: "echo bad"},
+			{Name: "good", Interval: 2 * time.Second, Command: "echo good"},
+		})
+		close(done)
+	}()
+
+	tickerA.tick() // "bad": should be skipped, not run
+	tickerB.tick() // "good": should run normally
+	waitForCallCount(t, runner, 1)
+
+	cancel()
+	waitForDone(t, done)
+
+	if runner.callCount() != 1 || runner.calls[0] != "echo good" {
+		t.Errorf("calls = %v, want exactly [\"echo good\"]", runner.calls)
+	}
+	if !strings.Contains(errBuf.String(), "[error] bad: commitment verification failed") {
 		t.Errorf("errBuf = %q", errBuf.String())
 	}
 }
@@ -162,7 +266,7 @@ func TestSchedulerRunDrivesTicksForOneJob(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		sched.Run(ctx, []Job{{Name: "j", Interval: time.Second, Command: "echo hi"}})
+		sched.Run(ctx, []pconfig.Job{{Name: "j", Interval: time.Second, Command: "echo hi"}})
 		close(done)
 	}()
 
@@ -199,7 +303,7 @@ func TestSchedulerRunDrivesTwoJobsIndependently(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		sched.Run(ctx, []Job{
+		sched.Run(ctx, []pconfig.Job{
 			{Name: "a", Interval: time.Second, Command: "echo a"},
 			{Name: "b", Interval: 2 * time.Second, Command: "echo b"},
 		})
@@ -236,7 +340,7 @@ func TestSchedulerRunCancelsPromptly(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		sched.Run(ctx, []Job{{Name: "j", Interval: time.Second, Command: "echo hi"}})
+		sched.Run(ctx, []pconfig.Job{{Name: "j", Interval: time.Second, Command: "echo hi"}})
 		close(done)
 	}()
 

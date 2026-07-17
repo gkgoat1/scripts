@@ -12,11 +12,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/gkgoat1/scripts/commitment/anchor"
 	"github.com/gkgoat1/scripts/internal/proxypass"
+	pconfig "github.com/gkgoat1/scripts/pulse/config"
 )
 
 func main() {
-	configPath := flag.String("config", defaultConfigPath(), "path to job config file")
+	configPath := flag.String("config", pconfig.DefaultConfigPath(), "path to job config file")
 	once := flag.Bool("once", false, "fire every job once immediately and exit (ignores intervals; still honors the load gate)")
 	proxy := flag.Bool("proxy", false, "start a loopback passthrough proxy and inject it into each job")
 	flag.Usage = func() {
@@ -27,7 +29,7 @@ func main() {
 	}
 	flag.Parse()
 
-	jobs, err := LoadConfig(*configPath)
+	jobs, err := pconfig.LoadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[error] %v\n", err)
 		os.Exit(2)
@@ -48,6 +50,10 @@ func main() {
 	}
 
 	sched := NewScheduler(realCommandRunner{proxyURL: proxyURL}, sysctlLoadChecker{}, newRealTicker, os.Stdout, os.Stderr)
+	sched.Verifier = realCommitmentVerifier{
+		Anchor:    anchor.PlistAnchorReader{Converter: anchor.NewRealPlistToJSON()},
+		ProofFile: *configPath + ".proof",
+	}
 
 	if *once {
 		for _, j := range jobs {

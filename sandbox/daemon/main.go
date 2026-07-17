@@ -20,7 +20,10 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/gkgoat1/scripts/commitment"
+	"github.com/gkgoat1/scripts/commitment/anchor"
 	"github.com/gkgoat1/scripts/internal/proxypass"
+	interposeconfig "github.com/gkgoat1/scripts/interpose/config"
 	"github.com/gkgoat1/scripts/interpose/policy/tcc"
 )
 
@@ -52,6 +55,11 @@ type server struct {
 	cacheSources                     map[string]string
 	procs                            map[int]process
 	mu                               sync.Mutex
+
+	// protectedRoots is computed once at startup by verifyPolicy: the fixed
+	// built-in TCC roots, plus config-supplied ExtraProtectedPaths only if
+	// they verified against the commitment anchor. See policy_verify.go.
+	protectedRoots []string
 }
 
 type originalEntitlements struct{ jit, unsigned, task bool }
@@ -98,6 +106,24 @@ func main() {
 			}
 		}
 	}
+
+	defaultRoots, drErr := tcc.DefaultProtectedRoots()
+	if drErr != nil {
+		defaultRoots = nil // extremely unlikely (os.UserHomeDir failing); degrade rather than panic
+	}
+	proofData, proofReadErr := os.ReadFile(interposeconfig.DefaultConfigPath() + ".proof")
+	var proofFile commitment.ProofFile
+	proofErr := proofReadErr
+	if proofReadErr == nil {
+		proofFile, proofErr = commitment.DecodeProofFile(proofData)
+	}
+	extra, _, warnMsg := verifyPolicy(interposeconfig.Load(),
+		anchor.PlistAnchorReader{Converter: anchor.NewRealPlistToJSON()}, proofFile, proofErr)
+	if warnMsg != "" {
+		fmt.Fprintf(os.Stderr, "[warn] sandboxd: %s\n", warnMsg)
+	}
+	s.protectedRoots = append(append([]string{}, defaultRoots...), extra...)
+
 	_ = os.Remove(s.socket)
 	if err := os.MkdirAll(filepath.Dir(s.socket), 0700); err != nil {
 		panic(err)
@@ -404,12 +430,19 @@ func (s *server) updateHash(pid int, path string) bool {
 	return true
 }
 
+// isProtected reports whether norm is or is under one of s.protectedRoots
+// (the verified-or-fallback root set computed once at startup — see
+// policy_verify.go — rather than the live, unverified global config).
+func (s *server) isProtected(norm string) bool {
+	return tcc.MatchesRoots(norm, s.protectedRoots)
+}
+
 func (s *server) pathPolicy(path string) string {
 	norm, err := tcc.NormalizePath(path)
 	if err != nil {
 		return policyDenied
 	}
-	if tcc.IsProtected(norm) {
+	if s.isProtected(norm) {
 		return policyDenied
 	}
 	dir := filepath.Dir(norm)

@@ -11,6 +11,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	pconfig "github.com/gkgoat1/scripts/pulse/config"
 )
 
 // CommandRunner executes a shell command and reports its exit code.
@@ -29,6 +31,15 @@ type Ticker interface {
 	Stop()
 }
 
+// CommitmentVerifier reports whether job's currently-configured Command still
+// matches what was last committed to the anchor root (see commitment/anchor
+// and docs/agentcommit.md). A nil Scheduler.Verifier means the feature is
+// off entirely — fully backward compatible with pulse runs that never adopt
+// commitment verification (e.g. an anchor was never installed).
+type CommitmentVerifier interface {
+	Verify(job pconfig.Job) (ok bool, reason string, err error)
+}
+
 // Scheduler runs a set of Jobs, one goroutine per job, until its context is done.
 type Scheduler struct {
 	Runner    CommandRunner
@@ -36,6 +47,7 @@ type Scheduler struct {
 	NewTicker func(time.Duration) Ticker
 	Out       io.Writer
 	Err       io.Writer
+	Verifier  CommitmentVerifier // nil = commitment verification disabled
 
 	logMu sync.Mutex // guards writes to Out/Err, since jobs fire concurrently
 }
@@ -47,7 +59,7 @@ func NewScheduler(runner CommandRunner, loadCheck LoadChecker, newTicker func(ti
 
 // Run spawns one goroutine per job and blocks until ctx is cancelled and every
 // job goroutine has returned (i.e. any in-flight fire has completed).
-func (s *Scheduler) Run(ctx context.Context, jobs []Job) {
+func (s *Scheduler) Run(ctx context.Context, jobs []pconfig.Job) {
 	var wg sync.WaitGroup
 	for _, job := range jobs {
 		job := job
@@ -69,8 +81,21 @@ func (s *Scheduler) Run(ctx context.Context, jobs []Job) {
 	wg.Wait()
 }
 
-// fire evaluates the optional load gate and, if it passes, runs job.Command once.
-func (s *Scheduler) fire(job Job) {
+// fire evaluates the optional commitment check and load gate, and, if both
+// pass, runs job.Command once.
+func (s *Scheduler) fire(job pconfig.Job) {
+	if s.Verifier != nil {
+		ok, reason, err := s.Verifier.Verify(job)
+		if err != nil {
+			s.logf(s.Err, "[error] %s: commitment check failed, skipping: %v\n", job.Name, err)
+			return
+		}
+		if !ok {
+			s.logf(s.Err, "[error] %s: commitment verification failed (%s), skipping — tampered or never committed\n", job.Name, reason)
+			return
+		}
+	}
+
 	if job.MaxLoad1 != nil {
 		load, err := s.LoadCheck.Load1()
 		if err != nil {

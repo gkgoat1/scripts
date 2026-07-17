@@ -21,15 +21,41 @@ func DefaultProtectedRelative() []string {
 	}
 }
 
-// ProtectedRoots returns absolute paths that should not be traversed.
-func ProtectedRoots() []string {
+// DefaultProtectedRoots returns the fixed, config-independent set of
+// TCC-sensitive absolute roots (home + DefaultProtectedRelative()). This is
+// what a verified caller (e.g. sandboxd) falls back to when policy
+// commitment verification fails: config only ever broadens protection, so
+// reverting to these can never be more permissive than an operator with no
+// custom config already gets.
+func DefaultProtectedRoots() ([]string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return config.Load().ExtraProtectedPaths
+		return nil, err
 	}
-	var roots []string
+	roots := make([]string, 0, len(DefaultProtectedRelative()))
 	for _, rel := range DefaultProtectedRelative() {
 		roots = append(roots, filepath.Join(home, rel))
+	}
+	return roots, nil
+}
+
+// MatchesRoots reports whether path is or is under any of roots.
+func MatchesRoots(path string, roots []string) bool {
+	for _, root := range roots {
+		root = filepath.Clean(root)
+		if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// ProtectedRoots returns absolute paths that should not be traversed:
+// DefaultProtectedRoots() plus any config-supplied ExtraProtectedPaths.
+func ProtectedRoots() []string {
+	roots, err := DefaultProtectedRoots()
+	if err != nil {
+		return config.Load().ExtraProtectedPaths
 	}
 	roots = append(roots, config.Load().ExtraProtectedPaths...)
 	return roots
@@ -74,13 +100,7 @@ func IsProtected(path string) bool {
 	if err != nil || norm == "" {
 		return false
 	}
-	for _, root := range ProtectedRoots() {
-		root = filepath.Clean(root)
-		if norm == root || strings.HasPrefix(norm, root+string(filepath.Separator)) {
-			return true
-		}
-	}
-	return false
+	return MatchesRoots(norm, ProtectedRoots())
 }
 
 // IsProtectedDirName reports whether name is a macOS TCC-sensitive directory basename.

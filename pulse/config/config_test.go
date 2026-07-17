@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"strings"
@@ -73,9 +73,9 @@ command: echo a
 
 func TestParseConfigMissingFields(t *testing.T) {
 	cases := []string{
-		"job: a\ncommand: echo a\n",           // missing interval
-		"job: a\ninterval: 1m\n",              // missing command
-		"interval: 1m\ncommand: echo a\n",     // missing job
+		"job: a\ncommand: echo a\n",       // missing interval
+		"job: a\ninterval: 1m\n",          // missing command
+		"interval: 1m\ncommand: echo a\n", // missing job
 	}
 	for _, src := range cases {
 		if _, err := ParseConfig(strings.NewReader(src)); err == nil {
