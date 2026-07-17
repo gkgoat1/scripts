@@ -43,7 +43,7 @@ mkdir -p "$(dirname "$DEST")" "$DEST"
 echo "Building interpose..."
 go build -o "${DEST}/interpose" "${ROOT}/interpose"
 
-for cmd in git find grep; do
+for cmd in git find grep kill pkill killall osascript; do
   ln -sf interpose "${DEST}/${cmd}"
 done
 

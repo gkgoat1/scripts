@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/gkgoat1/scripts/commitment"
 	interposeconfig "github.com/gkgoat1/scripts/interpose/config"
+	interposecommand "github.com/gkgoat1/scripts/interpose/policy/command"
 	pconfig "github.com/gkgoat1/scripts/pulse/config"
+	sandboxconfig "github.com/gkgoat1/scripts/sandbox/config"
 )
 
 // runCommit gathers leaves from every registered tool (pulse's jobs, if its
@@ -34,10 +37,28 @@ func runCommit(pulseConfigPath string, out, errw io.Writer) ([32]byte, error) {
 	}
 
 	policy := interposeconfig.Load().CommitLeaf()
+	commandPolicy, err := interposecommand.Load(interposecommand.DefaultConfigPath())
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("interpose command policy: %w", err)
+	}
+	commandLeaf := commandPolicy.CommitLeaf()
 
-	all := make([]commitment.Leaf, 0, len(pulseLeaves)+1)
+	var sandboxLeaves []commitment.Leaf
+	sandboxCfg, serr := sandboxconfig.Load(sandboxconfig.DefaultConfigPath())
+	switch {
+	case serr == nil:
+		sandboxLeaves = append(sandboxLeaves, sandboxCfg.CommitLeaf())
+		fmt.Fprintf(errw, "[commit] sandbox: policy committed\n")
+	case errors.Is(serr, os.ErrNotExist):
+		fmt.Fprintf(errw, "[skip] sandbox: no config found at %s\n", sandboxconfig.DefaultConfigPath())
+	default:
+		return [32]byte{}, fmt.Errorf("sandbox: %w", serr)
+	}
+
+	all := make([]commitment.Leaf, 0, len(pulseLeaves)+2+len(sandboxLeaves))
 	all = append(all, pulseLeaves...)
-	all = append(all, policy)
+	all = append(all, policy, commandLeaf)
+	all = append(all, sandboxLeaves...)
 
 	tree, err := commitment.Build(all)
 	if err != nil {
@@ -53,7 +74,15 @@ func runCommit(pulseConfigPath string, out, errw io.Writer) ([32]byte, error) {
 	if err := writeProofSidecar(tree, root, []commitment.Leaf{policy}, interposeconfig.DefaultConfigPath()+".proof"); err != nil {
 		return [32]byte{}, fmt.Errorf("interpose: %w", err)
 	}
-	fmt.Fprintf(errw, "[commit] interpose: policy committed\n")
+	if err := writeProofSidecar(tree, root, []commitment.Leaf{commandLeaf}, interposecommand.DefaultConfigPath()+".proof"); err != nil {
+		return [32]byte{}, fmt.Errorf("interpose command policy: %w", err)
+	}
+	fmt.Fprintf(errw, "[commit] interpose command policy: committed\n")
+	if len(sandboxLeaves) > 0 {
+		if err := writeProofSidecar(tree, root, sandboxLeaves, sandboxconfig.DefaultConfigPath()+".proof"); err != nil {
+			return [32]byte{}, fmt.Errorf("sandbox: %w", err)
+		}
+	}
 
 	fmt.Fprintln(out, commitment.RootHex(root))
 	return root, nil
@@ -78,6 +107,9 @@ func writeProofSidecar(tree *commitment.Tree, root [32]byte, leaves []commitment
 // never observes a partially-written proof sidecar. Mirrors
 // extclean/jsonapply.go's atomicWriteFile.
 func atomicWriteFile(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create parent directory for %s: %w", path, err)
+	}
 	tmp := path + ".agentcommit.tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", tmp, err)

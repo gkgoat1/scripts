@@ -82,6 +82,7 @@ func (c Config) CommitLeaf() commitment.Leaf
 |---|---|---|---|
 | `pulse` | `KindCommand` | one leaf per job | `Command` only (not `Interval`/`MaxLoad1` — see Out of scope) |
 | `interpose` (shared with `sandboxd`) | `KindPolicy` | one leaf for the whole config | `ExtraProtectedPaths`, `DisableSnapshot` (not `SnapshotPrefix`/`ToolTimeout` — cosmetic, not access-control-relevant) |
+| `interpose-command` | `KindPolicy` | one leaf for the entire `kill`/`pkill`/`killall`/`osascript` allowlist | all command names and exact argv rules |
 
 The policy leaf is deliberately coarse — one leaf covering the whole deny-list, not one per
 entry — so an attacker can't narrow the list while leaving individual untouched entries' proofs
@@ -137,7 +138,9 @@ choice and reasoning explicitly rather than inheriting the other's by default.
 
 `install-agentcommit-anchor.sh` builds `agentcommit`, runs `agentcommit commit` (writes
 `~/.config/pulse/jobs.proof` if pulse has a config, always writes
-`~/.config/interpose/config.proof`), and calls `installer/launchagent.sh`'s existing
+`~/.config/interpose/config.proof`) and always writes
+`~/.config/interpose/command-allowlist.json.proof` for the process-control
+command allowlist, then calls `installer/launchagent.sh`'s existing
 `launchagent_install` — reused unmodified — to (re)write the anchor plist with the new root. One
 script run, one BlockBlock/LuLu-visible write, regardless of how many leaves changed underneath it.
 

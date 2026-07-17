@@ -64,6 +64,13 @@ with a library load constraint equivalent to:
 </plist>
 ```
 
+The cdhash constraint is required in **every** signing mode. With a real
+identity, retain Team ID and signing identifier checks as additional provenance
+constraints where the platform supports their conjunction; the signing key is
+not a substitute for pinning the exact staged shim. Outside this macOS
+library-load constraint, sandbox code maps use complete-file SHA-256 hashes
+rather than cdhashes.
+
 The exact identity and Team ID are deployment-specific. The constraint is
 embedded using:
 

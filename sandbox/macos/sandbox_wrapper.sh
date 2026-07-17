@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-cache_dir="${HOME}/Library/Caches/sandbox"
+cache_dir="${SANDBOX_SHIM%/*}"
 mkdir -p "$cache_dir"
 [[ $# -gt 0 ]] || { echo 'usage: sandbox/run.sh command [args...]' >&2; exit 2; }
-shim="$cache_dir/sandbox.dylib"
+shim="${SANDBOX_SHIM:-$cache_dir/sandbox.dylib}"
 codesign_identity="${SANDBOX_CODESIGN_IDENTITY:-}"
 codesign_keychain="${SANDBOX_CODESIGN_KEYCHAIN:-}"
 if [[ -z "$codesign_identity" ]]; then

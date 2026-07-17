@@ -5,9 +5,54 @@ library connects during process startup, registers its PID, and reuses that
 connection for `ENV` and `OPEN` requests. After `fork`, the child closes the
 inherited descriptor and opens a new `CLOEXEC` connection with its parent PID.
 
-## Environment policy
+## Sandbox hash-map policy
 
-`SANDBOX_ENV_ALLOW` contains `VARIABLE=SHA256[,SHA256]` rules. `getenv()` is
+Sandbox authorization is configured in the selected logical home's
+`Library/Application Support/sandbox/config.json`, not with
+`SANDBOX_ENV_ALLOW` or `SANDBOX_HASH_UPDATERS` (both are rejected by the
+launcher). Start a sandbox for a fixture or alternate home with:
+
+```bash
+sandbox/run.sh --home /absolute/test-home command
+```
+
+All state is derived from that `--home`: configuration, proof, and hash-map log
+are under its `Library/Application Support/sandbox`; a verified committed run
+uses its `Library/Caches/sandbox`; and an uncommitted test run uses a private
+subdirectory of its `tmp/sandbox`. This permits isolated tests without touching
+the real user's `Library` or requiring its commitment anchor.
+
+A process identity is a digest of sorted canonical JSON mapping absolute,
+symlink-resolved paths to **full-file SHA-256 hashes**. The main executable and
+every subsequently accepted source/code file remain in the map. An update is
+accepted only when its resulting complete map digest appears in a configured
+transition rule; an extension alone never authorizes a change. The same format
+is used on macOS and Linux.
+
+The map log at `Library/Application Support/sandbox/hash-map-log.json` records
+`map digest -> map` for operator inspection. It is descriptive only: the daemon
+recomputes every candidate map digest and authorization comes only from config
+(and, for cache use, a valid Merkle proof/anchor).
+
+`cdhash` is not a code-map file hash. It is used only to pin the exact staged
+shim in the macOS hardened-runtime library-load constraint, even when a real
+signing identity is available.
+
+## Legacy environment policy
+
+The following historic interface is no longer accepted:
+
+```bash
+SANDBOX_HASH_UPDATERS='...' SANDBOX_ENV_ALLOW='...' sandbox/run.sh ...
+```
+
+Migrate it to committed sandbox configuration that lists initial/result map
+digests and environment grants.
+
+## Previous environment policy (historical behavior)
+
+`SANDBOX_ENV_ALLOW` was the historic environment-policy format. It is retained
+below only to describe old invocations; new launchers reject it. `getenv()` is
 enforced at lookup time, rather than only during `execve`: unauthorized values
 are returned as an empty string. This means an authorized nested agent can
 continue to use a key while an intermediate spawner cannot read it. A daemon
@@ -53,11 +98,10 @@ Response codes:
 - `UPDATED` — the path is allowed and the process identity hash was updated
   (interpreter/code hash update policy).
 
-## Interpreter/code hash updates
+## Previous interpreter/code hash updates (historical behavior)
 
-```bash
-SANDBOX_HASH_UPDATERS='INTERPRETER_HASH=.py,.js,.wasm' sandbox/run.sh python
-```
+The following describes the replaced environment-variable interface and is not
+accepted by the current launcher.
 
 The daemon accepts `--hash-updater BINARY_SHA256=EXT[,EXT]`. An `OPEN pid path`
 request updates that process's effective hash only if the current hash is an

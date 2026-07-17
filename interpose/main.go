@@ -13,36 +13,33 @@ func main() {
 	name := filepath.Base(os.Args[0])
 	args := os.Args[1:]
 
-	var w core.Wrapper
-	switch name {
-	case "git":
-		w = wrappers.Git{}
-	case "find":
-		w = wrappers.Find{}
-	case "grep":
-		w = wrappers.Grep{}
-	case "interpose":
+	if name == "interpose" {
 		if len(args) == 0 {
-			fmt.Fprintln(os.Stderr, "usage: interpose <git|find|grep> [args...]")
+			fmt.Fprintln(os.Stderr, "usage: interpose <git|find|grep|kill|pkill|killall|osascript> [args...]")
 			os.Exit(2)
 		}
-		name = args[0]
-		args = args[1:]
-		switch name {
-		case "git":
-			w = wrappers.Git{}
-		case "find":
-			w = wrappers.Find{}
-		case "grep":
-			w = wrappers.Grep{}
-		default:
-			fmt.Fprintf(os.Stderr, "interpose: unknown command %q\n", name)
-			os.Exit(2)
-		}
-	default:
-		fmt.Fprintf(os.Stderr, "interpose: unknown invocation name %q\n", name)
-		os.Exit(2)
+		name, args = args[0], args[1:]
 	}
 
+	w, ok := wrapperFor(name)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "interpose: unknown command %q\n", name)
+		os.Exit(2)
+	}
 	core.Execute(w, args)
+}
+
+func wrapperFor(name string) (core.Wrapper, bool) {
+	switch name {
+	case "git":
+		return wrappers.Git{}, true
+	case "find":
+		return wrappers.Find{}, true
+	case "grep":
+		return wrappers.Grep{}, true
+	case "kill", "pkill", "killall", "osascript":
+		return wrappers.ProtectedCommand{CommandName: name}, true
+	default:
+		return nil, false
+	}
 }

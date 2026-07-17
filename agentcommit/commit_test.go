@@ -9,6 +9,7 @@ import (
 
 	"github.com/gkgoat1/scripts/commitment"
 	interposeconfig "github.com/gkgoat1/scripts/interpose/config"
+	interposecommand "github.com/gkgoat1/scripts/interpose/policy/command"
 	pconfig "github.com/gkgoat1/scripts/pulse/config"
 )
 
@@ -64,6 +65,11 @@ func TestRunCommitWritesSidecarsAndPrintsMatchingRoot(t *testing.T) {
 		leaves = append(leaves, j.CommitLeaf())
 	}
 	leaves = append(leaves, interposeconfig.Load().CommitLeaf())
+	commandPolicy, err := interposecommand.Load(interposecommand.DefaultConfigPath())
+	if err != nil {
+		t.Fatalf("Load command allowlist: %v", err)
+	}
+	leaves = append(leaves, commandPolicy.CommitLeaf())
 	wantTree, err := commitment.Build(leaves)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
@@ -107,6 +113,22 @@ func TestRunCommitWritesSidecarsAndPrintsMatchingRoot(t *testing.T) {
 	if !commitment.VerifyProof(interposeconfig.Load().CommitLeaf(), policyProof, root) {
 		t.Error("policy proof does not verify against root")
 	}
+	// Command-policy sidecar: allowlist entry verifies against root.
+	commandProofData, err := os.ReadFile(interposecommand.DefaultConfigPath() + ".proof")
+	if err != nil {
+		t.Fatalf("read command-policy proof sidecar: %v", err)
+	}
+	commandPF, err := commitment.DecodeProofFile(commandProofData)
+	if err != nil {
+		t.Fatalf("decode command-policy proof sidecar: %v", err)
+	}
+	commandProof, ok := commandPF.Entries[interposecommand.PolicyLeafID]
+	if !ok {
+		t.Fatal("no command-policy proof entry")
+	}
+	if !commitment.VerifyProof(commandPolicy.CommitLeaf(), commandProof, root) {
+		t.Error("command-policy proof does not verify against root")
+	}
 }
 
 func TestRunCommitNoPulseConfigSkipsPulseSidecar(t *testing.T) {
@@ -125,8 +147,12 @@ func TestRunCommitNoPulseConfigSkipsPulseSidecar(t *testing.T) {
 		t.Error("no pulse proof sidecar should be written when pulse has no config")
 	}
 
-	// Root should equal a tree built from ONLY the (default, empty) policy leaf.
-	wantTree, err := commitment.Build([]commitment.Leaf{interposeconfig.Load().CommitLeaf()})
+	// Root should equal a tree built from the default interpose and command-policy leaves.
+	commandPolicy, err := interposecommand.Load(interposecommand.DefaultConfigPath())
+	if err != nil {
+		t.Fatalf("Load command allowlist: %v", err)
+	}
+	wantTree, err := commitment.Build([]commitment.Leaf{interposeconfig.Load().CommitLeaf(), commandPolicy.CommitLeaf()})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -146,15 +172,17 @@ func TestRunCommitMalformedPulseConfigIsFatal(t *testing.T) {
 	}
 }
 
-func TestRunCommitInterposeAlwaysContributesOneLeaf(t *testing.T) {
-	home := setFakeHome(t) // no interpose config file written at all: default/empty Config
-	missing := filepath.Join(home, "jobs-does-not-exist")
+func TestRunCommitCreatesCommandPolicyParentDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	interposeconfig.Reset()
+	t.Cleanup(interposeconfig.Reset)
 
-	var out, errBuf bytes.Buffer
-	if _, err := runCommit(missing, &out, &errBuf); err != nil {
-		t.Fatalf("runCommit with no pulse and no interpose config: %v", err)
+	missing := filepath.Join(home, "jobs-does-not-exist")
+	if _, err := runCommit(missing, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("runCommit: %v", err)
 	}
-	if _, err := os.Stat(interposeconfig.DefaultConfigPath() + ".proof"); err != nil {
-		t.Errorf("interpose proof sidecar should always be written, even with a default config: %v", err)
+	if _, err := os.Stat(interposecommand.DefaultConfigPath() + ".proof"); err != nil {
+		t.Fatalf("command-policy proof sidecar: %v", err)
 	}
 }

@@ -2,13 +2,15 @@
 
 Interposers are thin wrappers installed **ahead** of real binaries on `PATH`. Each wrapper
 resolves the next matching executable **after itself** on `PATH` and delegates to it, applying
-security and backup tweaks first.
+security and backup tweaks first. The process-control wrappers (`kill`, `pkill`, `killall`, and
+`osascript`) are deliberately fail-closed: their policy must verify against the committed
+`agentcommit` anchor before any argument vector can pass without an interactive confirmation.
 
 ## Install
 
 ```sh
 ./install-interposers.sh
-# default: ~/.local/bin/interposers/{interpose,git,find,grep}
+# default: ~/.local/bin/interposers/{interpose,git,find,grep,kill,pkill,killall,osascript}
 ```
 
 This builds the wrappers and also adds the `PATH` export to `~/.profile` (created if
@@ -27,7 +29,10 @@ Everything else in your rc files is left untouched. Restart your shell (or re-so
 rc file) to pick up the change.
 
 `PATH` must still include `/usr/bin` (or wherever real tools live) **after** the interposer
-directory so delegation works.
+directory so delegation works. These are a defense-in-depth guard for programs invoked through
+this `PATH`, not a complete macOS containment boundary: a process that can execute an absolute
+path such as `/bin/kill`, rewrite its own `PATH`, or modify the installed wrapper can bypass it.
+Use OS-level endpoint controls in addition when defending against hostile local code.
 
 To remove the interposers and the `PATH` blocks they added:
 
@@ -65,6 +70,37 @@ etc.), injects BSD `find` prune clauses so those directories are never entered.
 Strips protected path operands from recursive searches and injects `--exclude-dir` for
 protected directory basenames. Emits warnings on stderr for skipped paths.
 
+### Process-control commands: `kill`, `pkill`, `killall`, `osascript`
+
+These wrappers protect against process-killing/extortion malware. They accept an invocation
+without a prompt **only** when its complete argument vector matches the committed command
+allowlist. Any non-match — including an unavailable, stale, or uncommitted allowlist — opens
+`/dev/tty` and asks the person at that terminal to enter and repeat the same **six-character**
+PIN. It refuses to delegate if there is no controlling terminal, so a background process cannot
+answer the prompt through stdin. `--no-interpose` is intentionally not an escape hatch for these
+four commands.
+
+The default policy is intentionally narrow: it permits only `kill -0 PID` (with optional `--`),
+a non-destructive liveness probe. `pkill`, `killall`, and `osascript` have no default-permitted
+arguments.
+
+To add an approved operation, create `~/.config/interpose/command-allowlist.json` with JSON
+mapping command names to exact argv vectors. `{pid}` is the only wildcard and matches a
+non-negative decimal PID:
+
+```json
+{
+  "kill": [["-0", "{pid}"], ["-TERM", "{pid}"]],
+  "pkill": [],
+  "killall": [],
+  "osascript": []
+}
+```
+
+After every allowlist edit, run `./install-agentcommit-anchor.sh` to write its inclusion proof
+and visibly update the anchored commitment. Until then, changed arguments require the repeated
+PIN rather than being silently trusted.
+
 ### Escape hatch
 
 Pass `--no-interpose` to skip wrapper transformations (git still runs; git snapshots are
@@ -84,12 +120,19 @@ snapshot-prefix: interpose/snapshot
 `sandbox/daemon/README.md`'s "Policy commitment verification"), which optionally verifies this
 config against a Merkle commitment before trusting it — see `docs/agentcommit.md`.
 
+The independent process-control allowlist is JSON at
+`~/.config/interpose/command-allowlist.json` (or its embedded default when absent); unlike this
+legacy config, it is always required to verify against the commitment before it is trusted.
+
 ## Adding a new wrapper
 
 1. Implement `core.Wrapper` in `interpose/wrappers/`.
 2. Register the command name in `interpose/main.go`.
 3. Add a symlink in `install-interposers.sh`.
 4. Add tests under `interpose/wrappers/` and `interpose/core/`.
+
+For a command that needs committed policy, add its policy leaf and proof sidecar to
+`agentcommit/commit.go`; do not treat an uncommitted configuration as trusted.
 
 The shared execution flow:
 

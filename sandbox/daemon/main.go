@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +26,8 @@ import (
 	"github.com/gkgoat1/scripts/internal/proxypass"
 	interposeconfig "github.com/gkgoat1/scripts/interpose/config"
 	"github.com/gkgoat1/scripts/interpose/policy/tcc"
+	sandboxconfig "github.com/gkgoat1/scripts/sandbox/config"
+	"github.com/gkgoat1/scripts/sandbox/hashmap"
 )
 
 const (
@@ -45,10 +48,14 @@ var shellConfigs = map[string]bool{
 
 type process struct {
 	pid, parent, pgid int
-	path, hash        string
+	path, hash        string // hash is the complete canonical hash-map digest
+	files             hashmap.Map
 }
 type server struct {
 	socket, shim, identity, keychain string
+	cacheDir                         string
+	policy                           sandboxconfig.Config
+	policyActive, policyTrusted      bool
 	allowGetTaskAllow                bool
 	envVars                          map[string]map[string]bool
 	hashUpdaters                     map[string]map[string]bool
@@ -92,18 +99,41 @@ func main() {
 				s.keychain = os.Args[i+1]
 				i++
 			}
+		case "--home":
+			if i+1 < len(os.Args) {
+				layout, err := sandboxconfig.NewLayout(os.Args[i+1])
+				if err != nil {
+					panic(err)
+				}
+				s.cacheDir = layout.TransientRoot
+				cfg, err := sandboxconfig.Load(layout.ConfigPath)
+				if err == nil {
+					s.policy = cfg
+					proofData, readErr := os.ReadFile(layout.ProofPath)
+					var proof commitment.ProofFile
+					var proofErr error
+					if readErr != nil {
+						proofErr = readErr
+					} else {
+						proof, proofErr = commitment.DecodeProofFile(proofData)
+					}
+					reader := anchor.PlistAnchorReader{Converter: anchor.NewRealPlistToJSON(), Path: layout.AnchorPath}
+					root, anchorErr := reader.ReadRoot()
+					switch {
+					case errors.Is(anchorErr, anchor.ErrAnchorNotInstalled):
+						// An isolated logical home is explicitly allowed to run its
+						// local config for tests, but never shares the committed cache.
+						s.policyActive = true
+					case anchorErr == nil && proofErr == nil:
+						if p, ok := proof.Entries[sandboxconfig.PolicyLeafID]; ok && commitment.VerifyProof(cfg.CommitLeaf(), p, root) {
+							s.policyActive, s.policyTrusted, s.cacheDir = true, true, layout.CacheDir
+						}
+					}
+				}
+				i++
+			}
 		case "--allow-get-task-allow":
 			s.allowGetTaskAllow = true
-		case "--env-allow":
-			if i+1 < len(os.Args) {
-				s.addEnvPolicy(os.Args[i+1])
-				i++
-			}
-		case "--hash-updater":
-			if i+1 < len(os.Args) {
-				s.addHashUpdater(os.Args[i+1])
-				i++
-			}
 		}
 	}
 
@@ -349,25 +379,24 @@ func (s *server) command(c net.Conn, line string) {
 	}
 }
 func (s *server) register(pid, parent int, path string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if source, ok := s.cacheSources[path]; ok {
-		path = source
-	}
-	sum, e := fileHash(path)
-	if e != nil {
+	m := hashmap.Map{Version: hashmap.Version, Files: map[string]string{}}
+	m, err := m.AddPath(path)
+	if err != nil {
 		return
 	}
-	s.procs[pid] = process{pid: pid, parent: parent, pgid: pid, path: path, hash: sum}
-}
-func fileHash(path string) (string, error) {
-	b, e := os.ReadFile(path)
-	if e != nil {
-		return "", e
+	digest, err := m.Digest()
+	if err != nil {
+		return
 	}
-	x := sha256.Sum256(b)
-	return hex.EncodeToString(x[:]), nil
+	canonical, _ := hashmap.CanonicalPath(path)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if source, ok := s.cacheSources[canonical]; ok {
+		canonical = source
+	}
+	s.procs[pid] = process{pid: pid, parent: parent, pgid: pid, path: canonical, hash: digest, files: m}
 }
+func fileHash(path string) (string, error) { return hashmap.FileHash(path) }
 func (s *server) addEnvPolicy(spec string) {
 	p := strings.SplitN(spec, "=", 2)
 	if len(p) != 2 || p[0] == "" {
@@ -402,12 +431,14 @@ func (s *server) addHashUpdater(spec string) {
 func (s *server) envAllowed(pid int, varName string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	allowed := s.envVars[varName]
-	if len(allowed) == 0 {
-		return true
-	}
 	p, ok := s.procs[pid]
-	return ok && allowed[p.hash]
+	if !ok {
+		return false
+	}
+	if s.policyActive {
+		return s.policy.EnvAllowed(varName, p.hash)
+	}
+	return false
 }
 func (s *server) updateHash(pid int, path string) bool {
 	s.mu.Lock()
@@ -416,16 +447,19 @@ func (s *server) updateHash(pid int, path string) bool {
 	if !ok {
 		return false
 	}
-	ext := strings.ToLower(filepath.Ext(path))
-	if !s.hashUpdaters[p.hash][ext] {
+	candidate, err := p.files.AddPath(path)
+	if err != nil {
 		return false
 	}
-	h, e := fileHash(path)
-	if e != nil {
+	digest, err := candidate.Digest()
+	if err != nil {
 		return false
 	}
-	p.hash = h
-	p.path = path
+	if !s.policyActive || !s.policy.AllowsUpdate(p.hash, filepath.Ext(path), digest) {
+		return false
+	}
+	canonical, _ := hashmap.CanonicalPath(path)
+	p.hash, p.path, p.files = digest, canonical, candidate
 	s.procs[pid] = p
 	return true
 }
@@ -479,11 +513,15 @@ func (s *server) rewrite(src string) (string, error) {
 	h.Write([]byte(s.identity))
 	h.Write([]byte(fmt.Sprintf("%t%t%t", orig.jit, orig.unsigned, orig.task && s.allowGetTaskAllow)))
 	name := hex.EncodeToString(h.Sum(nil))
-	cache, e := os.UserCacheDir()
-	if e != nil {
-		return "", e
+	cache := s.cacheDir
+	if cache == "" {
+		cache, e = os.UserCacheDir()
+		if e != nil {
+			return "", e
+		}
+		cache = filepath.Join(cache, "sandbox")
 	}
-	dir := filepath.Join(cache, "sandbox", "binaries")
+	dir := filepath.Join(cache, "binaries")
 	if e = os.MkdirAll(dir, 0700); e != nil {
 		return "", e
 	}
