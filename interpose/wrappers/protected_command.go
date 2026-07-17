@@ -2,11 +2,12 @@ package wrappers
 
 import (
 	"bufio"
+	"crypto/rand"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/gkgoat1/scripts/commitment/anchor"
 	"github.com/gkgoat1/scripts/interpose/core"
@@ -44,11 +45,18 @@ func (p ProtectedCommand) Before(ctx *core.Context) error {
 
 func (ProtectedCommand) After(_ *core.Context, _ error) error { return nil }
 
-// confirmSixCharacterPIN is deliberately a human-presence confirmation, not
-// a stored-password check: the user chooses a six-character value, then must
-// type exactly the same value again. Reading from /dev/tty prevents a
-// non-interactive program from satisfying the prompt through a stdin pipe.
+// confirmSixCharacterPIN emits a fresh random challenge rather than accepting
+// a user-selected value. This prevents a program that endlessly writes one
+// fixed string to the terminal from satisfying the confirmation. It is a
+// lightweight human-presence check, not a CAPTCHA or a cryptographic
+// authentication mechanism. Reading from /dev/tty prevents a non-interactive
+// program from satisfying the prompt through a stdin pipe.
 func confirmSixCharacterPIN(out io.Writer) error {
+	pin, err := newConfirmationPIN()
+	if err != nil {
+		return fmt.Errorf("operation denied: generate confirmation PIN: %w", err)
+	}
+
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
 		return fmt.Errorf("operation denied: cannot request PIN without a controlling terminal")
@@ -56,20 +64,25 @@ func confirmSixCharacterPIN(out io.Writer) error {
 	defer tty.Close()
 
 	reader := bufio.NewReader(tty)
-	fmt.Fprint(out, "Enter a 6-character confirmation PIN to continue: ")
-	first, err := readPIN(reader)
+	fmt.Fprintf(out, "Type this 6-digit confirmation PIN to continue: %s\nPIN: ", pin)
+	entered, err := readPIN(reader)
 	if err != nil {
 		return fmt.Errorf("operation denied: read confirmation PIN: %w", err)
 	}
-	fmt.Fprint(out, "Repeat the same 6-character PIN: ")
-	second, err := readPIN(reader)
-	if err != nil {
-		return fmt.Errorf("operation denied: read confirmation PIN: %w", err)
-	}
-	if utf8.RuneCountInString(first) != 6 || first != second {
-		return fmt.Errorf("operation denied: PINs must match and contain exactly 6 characters")
+	if entered != pin {
+		return fmt.Errorf("operation denied: confirmation PIN did not match")
 	}
 	return nil
+}
+
+// newConfirmationPIN returns a uniformly random six-digit challenge. Leading
+// zeroes are retained so every prompt has the same fixed width.
+func newConfirmationPIN() (string, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%06d", n.Int64()), nil
 }
 
 func readPIN(reader *bufio.Reader) (string, error) {

@@ -75,9 +75,11 @@ protected directory basenames. Emits warnings on stderr for skipped paths.
 These wrappers protect against process-killing/extortion malware. They accept an invocation
 without a prompt **only** when its complete argument vector matches the committed command
 allowlist. Any non-match — including an unavailable, stale, or uncommitted allowlist — opens
-`/dev/tty` and asks the person at that terminal to enter and repeat the same **six-character**
-PIN. It refuses to delegate if there is no controlling terminal, so a background process cannot
-answer the prompt through stdin. `--no-interpose` is intentionally not an escape hatch for these
+`/dev/tty`, displays a fresh cryptographically-random **six-digit** PIN, and requires the
+person at the terminal to type that exact displayed PIN. It refuses to delegate if there is no
+controlling terminal, so a background process cannot answer the prompt through stdin. Because
+this is a newly emitted challenge rather than a user-chosen value, a process continuously echoing
+a fixed response cannot satisfy it. `--no-interpose` is intentionally not an escape hatch for these
 four commands.
 
 The default policy is intentionally narrow: it permits only `kill -0 PID` (with optional `--`),
