@@ -19,6 +19,8 @@ static const char *rawenv(const char *name) {
     return fn ? fn(name) : NULL;
 }
 
+const char *sandbox_rawenv(const char *name) { return rawenv(name); }
+
 static void connect_daemon(void) {
     const char *p = rawenv("SANDBOX_DAEMON_SOCKET");
     if (!p)

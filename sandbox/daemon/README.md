@@ -38,7 +38,29 @@ recomputes every candidate map digest and authorization comes only from config
 shim in the macOS hardened-runtime library-load constraint, even when a real
 signing identity is available.
 
-## Legacy environment policy
+## Auto-interposition exec protocol
+
+When committed sandbox config enables Darwin `autoInterpose`, the macOS dylib
+uses a separate, bounded binary `SBX1` protocol connection for each hooked
+`execve`. It is deliberately separate from the legacy newline protocol: argv,
+environment, paths, and operation results are length-delimited and have strict
+frame/string/vector limits. The daemon authenticates the Unix peer PID and
+requires it to have registered in the sandbox before evaluating an exec.
+
+For a registered system command, sandboxd selects the committed sandbox-owned
+interposer policy and evaluates the relevant wrapper. Wrapper side effects use
+typed `GUEST_OPERATION` messages on the active transaction: an approved
+executable invocation, bounded file read, or guest `/dev/tty` PIN confirmation.
+The dylib performs these operations in the guest and reports structured result
+values; sandboxd never executes guest argv or a guest shell. A final approved
+exec returns the canonical path and transformed argv for the dylib to execute
+directly.
+
+The protocol implementation is intentionally fail-closed. A malformed frame,
+unknown operation, unregistered peer, invalid config commitment, operation
+failure, or denied wrapper decision prevents the managed `execve`. It currently
+covers the `execve`/`execv` entry points. Other exec-family variants must be
+mediated or rejected before coverage is claimed for them.
 
 The following historic interface is no longer accepted:
 

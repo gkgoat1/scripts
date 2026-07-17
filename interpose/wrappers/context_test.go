@@ -31,7 +31,8 @@ func (o *recordingGuestOps) Run(_ context.Context, command core.Command) (core.R
 func (*recordingGuestOps) ReadFile(context.Context, string) ([]byte, error) {
 	return nil, fmt.Errorf("unexpected guest file read")
 }
-func (*recordingGuestOps) Stderr() io.Writer { return io.Discard }
+func (*recordingGuestOps) ConfirmPIN(context.Context, string) error { return nil }
+func (*recordingGuestOps) Stderr() io.Writer                        { return io.Discard }
 
 func TestGitSnapshotUsesContextOperations(t *testing.T) {
 	ops := &recordingGuestOps{}

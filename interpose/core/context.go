@@ -1,11 +1,15 @@
 package core
 
 import (
+	"bufio"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 )
 
@@ -66,6 +70,7 @@ type Result struct{ ExitCode int }
 type Operations interface {
 	Run(ctx context.Context, command Command) (Result, error)
 	ReadFile(ctx context.Context, path string) ([]byte, error)
+	ConfirmPIN(ctx context.Context, prompt string) error
 	Stderr() io.Writer
 }
 
@@ -83,6 +88,35 @@ func (o *HostOperations) Stderr() io.Writer { return o.stderr }
 func (o *HostOperations) ReadFile(_ context.Context, path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
+func (o *HostOperations) ConfirmPIN(_ context.Context, prompt string) error {
+	pin, err := newConfirmationPIN()
+	if err != nil {
+		return fmt.Errorf("operation denied: generate confirmation PIN: %w", err)
+	}
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("operation denied: cannot request PIN without a controlling terminal")
+	}
+	defer tty.Close()
+	fmt.Fprintf(o.stderr, "%s: %s\nPIN: ", prompt, pin)
+	value, err := bufio.NewReader(tty).ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("operation denied: read confirmation PIN: %w", err)
+	}
+	if strings.TrimRight(value, "\r\n") != pin {
+		return fmt.Errorf("operation denied: confirmation PIN did not match")
+	}
+	return nil
+}
+
+func newConfirmationPIN() (string, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%06d", n.Int64()), nil
+}
+
 func (o *HostOperations) Run(ctx context.Context, spec Command) (Result, error) {
 	if spec.Path == "" {
 		return Result{}, fmt.Errorf("approved command has no executable path")
@@ -128,6 +162,13 @@ func ReadFile(ctx *Context, path string) ([]byte, error) {
 		return nil, fmt.Errorf("interpose context has no operations")
 	}
 	return ctx.Ops.ReadFile(context.Background(), path)
+}
+
+func ConfirmPIN(ctx *Context, prompt string) error {
+	if ctx == nil || ctx.Ops == nil {
+		return fmt.Errorf("interpose context has no operations")
+	}
+	return ctx.Ops.ConfirmPIN(context.Background(), prompt)
 }
 
 // RunCommand dispatches a typed command through the active operation realm.

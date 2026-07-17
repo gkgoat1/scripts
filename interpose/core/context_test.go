@@ -18,6 +18,7 @@ func (o *recordingOps) Run(_ context.Context, command core.Command) (core.Result
 	return core.Result{ExitCode: 17}, nil
 }
 func (*recordingOps) ReadFile(context.Context, string) ([]byte, error) { return nil, nil }
+func (*recordingOps) ConfirmPIN(context.Context, string) error         { return nil }
 func (*recordingOps) Stderr() io.Writer                                { return io.Discard }
 
 func TestRunUsesContextOperations(t *testing.T) {

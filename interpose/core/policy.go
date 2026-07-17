@@ -1,6 +1,7 @@
 package core
 
 import (
+	"github.com/gkgoat1/scripts/commitment/anchor"
 	"github.com/gkgoat1/scripts/interpose/config"
 	commandpolicy "github.com/gkgoat1/scripts/interpose/policy/command"
 	"github.com/gkgoat1/scripts/interpose/policy/tcc"
@@ -16,7 +17,10 @@ func HostPolicyView() PolicyView {
 		roots = nil
 	}
 	roots = append(roots, cfg.ExtraProtectedPaths...)
-	list, _ := commandpolicy.Load(commandpolicy.DefaultConfigPath())
+	list, err := commandpolicy.Verify(commandpolicy.DefaultConfigPath(), anchor.PlistAnchorReader{Converter: anchor.NewRealPlistToJSON()})
+	if err != nil {
+		list = nil
+	}
 	return PolicyView{
 		ExtraProtectedPaths: roots,
 		DisableSnapshot:     append([]string(nil), cfg.DisableSnapshot...),

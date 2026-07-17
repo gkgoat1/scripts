@@ -26,9 +26,12 @@ import (
 	"github.com/gkgoat1/scripts/commitment/anchor"
 	"github.com/gkgoat1/scripts/internal/proxypass"
 	interposeconfig "github.com/gkgoat1/scripts/interpose/config"
+	"github.com/gkgoat1/scripts/interpose/core"
 	"github.com/gkgoat1/scripts/interpose/policy/tcc"
+	"github.com/gkgoat1/scripts/interpose/wrappers"
 	sandboxconfig "github.com/gkgoat1/scripts/sandbox/config"
 	"github.com/gkgoat1/scripts/sandbox/hashmap"
+	"github.com/gkgoat1/scripts/sandbox/protocol"
 )
 
 const (
@@ -109,15 +112,8 @@ func main() {
 				s.cacheDir = layout.TransientRoot
 				cfg, err := sandboxconfig.Load(layout.ConfigPath)
 				if err == nil {
-					if cfg.AutoInterpose.Enabled {
-						if runtime.GOOS != "darwin" {
-							fmt.Fprintln(os.Stderr, "sandbox: autoInterpose is not supported on Linux; see sandbox/linux-known-gaps.md")
-						} else {
-							// Do not permit a committed configuration to imply coverage
-							// before the exec protocol exists. The feature is fail-closed
-							// until the macOS shim/daemon implementation lands.
-							fmt.Fprintln(os.Stderr, "sandbox: autoInterpose macOS exec protocol is not available")
-						}
+					if cfg.AutoInterpose.Enabled && runtime.GOOS != "darwin" {
+						fmt.Fprintln(os.Stderr, "sandbox: autoInterpose is not supported on Linux; see sandbox/linux-known-gaps.md")
 						os.Exit(2)
 					}
 					s.policy = cfg
@@ -222,6 +218,12 @@ func sendFD(uc *net.UnixConn, status string, fd int) error {
 func (s *server) handle(c net.Conn) {
 	defer c.Close()
 	r := bufio.NewReader(c)
+	magic, err := r.Peek(len(protocol.Magic))
+	if err == nil && string(magic) == protocol.Magic {
+		_, _ = r.Discard(len(protocol.Magic))
+		s.handleProtocol(c, r)
+		return
+	}
 	for {
 		line, e := r.ReadString('\n')
 		if e != nil {
@@ -229,6 +231,174 @@ func (s *server) handle(c net.Conn) {
 		}
 		s.command(c, strings.TrimSpace(line))
 	}
+}
+
+type remoteGuestOperations struct {
+	server *server
+	conn   net.Conn
+	reader *bufio.Reader
+	nextID uint64
+}
+
+func (o *remoteGuestOperations) Stderr() io.Writer { return io.Discard }
+func (o *remoteGuestOperations) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	result, err := o.operation(ctx, protocol.Operation{Kind: protocol.OpRead, Path: path})
+	if err != nil {
+		return nil, err
+	}
+	return result.Data, nil
+}
+func (o *remoteGuestOperations) ConfirmPIN(ctx context.Context, prompt string) error {
+	_, err := o.operation(ctx, protocol.Operation{Kind: protocol.OpConfirm, Prompt: prompt})
+	return err
+}
+func (o *remoteGuestOperations) Run(ctx context.Context, command core.Command) (core.Result, error) {
+	if !filepath.IsAbs(command.Path) {
+		return core.Result{}, fmt.Errorf("approved command has a non-absolute path")
+	}
+	// An approved helper must itself be rewritten so its new process image loads
+	// the shim. Spawning the host system binary directly here would put Git's
+	// snapshot/restore work outside the guest sandbox.
+	guestPath, err := o.server.rewrite(command.Path)
+	if err != nil {
+		return core.Result{}, fmt.Errorf("stage approved guest command: %w", err)
+	}
+	var capture bool
+	if command.Stdout != nil {
+		capture = true
+	}
+	result, err := o.operation(ctx, protocol.Operation{Kind: protocol.OpRun, Path: guestPath, Args: append([]string{filepath.Base(command.Path)}, command.Args...), Dir: command.Dir, Env: command.Env, Capture: capture})
+	if err != nil {
+		return core.Result{}, err
+	}
+	if capture {
+		_, _ = command.Stdout.Write(result.Data)
+	}
+	return core.Result{ExitCode: int(result.ExitCode)}, nil
+}
+func (o *remoteGuestOperations) operation(ctx context.Context, op protocol.Operation) (protocol.OperationResult, error) {
+	if err := ctx.Err(); err != nil {
+		return protocol.OperationResult{}, err
+	}
+	o.nextID++
+	op.ID = o.nextID
+	payload, err := protocol.EncodeOperation(op)
+	if err != nil {
+		return protocol.OperationResult{}, err
+	}
+	if err := protocol.WriteFrame(o.conn, protocol.TypeOpReq, payload); err != nil {
+		return protocol.OperationResult{}, err
+	}
+	typ, response, err := protocol.ReadFrame(o.reader)
+	if err != nil {
+		return protocol.OperationResult{}, err
+	}
+	if typ != protocol.TypeOpRes {
+		return protocol.OperationResult{}, fmt.Errorf("unexpected guest operation response")
+	}
+	result, err := protocol.DecodeOperationResult(response)
+	if err != nil {
+		return protocol.OperationResult{}, err
+	}
+	if result.ID != op.ID || !result.OK {
+		if result.Message == "" {
+			result.Message = "guest operation denied"
+		}
+		return protocol.OperationResult{}, errors.New(result.Message)
+	}
+	return result, nil
+}
+
+// handleProtocol serves one bounded exec transaction. It is deliberately
+// separate from the legacy text protocol so argv/environment cannot be split
+// by whitespace. The dylib implementation will send the magic before its first
+// EXEC request and service typed operation requests until a final decision.
+func (s *server) handleProtocol(c net.Conn, r *bufio.Reader) {
+	if err := protocol.WriteMagic(c); err != nil {
+		return
+	}
+	typ, payload, err := protocol.ReadFrame(r)
+	if err != nil || typ != protocol.TypeExecReq {
+		return
+	}
+	req, err := protocol.DecodeExecRequest(payload)
+	if err != nil {
+		s.writeExecResult(c, protocol.ExecResult{Message: "invalid exec request"})
+		return
+	}
+	result := s.evaluateExec(c, r, req)
+	s.writeExecResult(c, result)
+}
+func (s *server) writeExecResult(c net.Conn, result protocol.ExecResult) {
+	payload, err := protocol.EncodeExecResult(result)
+	if err == nil {
+		_ = protocol.WriteFrame(c, protocol.TypeExecRes, payload)
+	}
+}
+func (s *server) evaluateExec(c net.Conn, r *bufio.Reader, req protocol.ExecRequest) protocol.ExecResult {
+	pid, err := peerPID(c)
+	if err != nil {
+		return protocol.ExecResult{Message: "cannot identify guest peer"}
+	}
+	s.mu.Lock()
+	_, registered := s.procs[pid]
+	s.mu.Unlock()
+	if !registered {
+		return protocol.ExecResult{Message: "guest peer is not registered"}
+	}
+	if !s.policyTrusted || !s.policy.AutoInterpose.Enabled {
+		return protocol.ExecResult{Message: "auto-interposition policy is not committed"}
+	}
+	if !filepath.IsAbs(req.Path) || !filepath.IsAbs(req.Dir) || len(req.Argv) == 0 {
+		return protocol.ExecResult{Message: "invalid exec path, directory, or argv"}
+	}
+	path, err := filepath.EvalSymlinks(req.Path)
+	if err != nil {
+		return protocol.ExecResult{Message: "cannot resolve exec path"}
+	}
+	name, wrapper := s.autoWrapper(path)
+	if wrapper == nil {
+		return protocol.ExecResult{Allowed: true, Path: path, Argv: req.Argv, Env: req.Env}
+	}
+	view := core.PolicyView{ExtraProtectedPaths: append([]string(nil), s.policy.AutoInterpose.Policy.ExtraProtectedPaths...), DisableSnapshot: append([]string(nil), s.policy.AutoInterpose.Policy.DisableSnapshot...), SnapshotPrefix: "interpose/snapshot", CommandAllowlist: s.policy.AutoInterpose.Policy.CommandAllowlist}
+	ops := &remoteGuestOperations{server: s, conn: c, reader: r}
+	ctx := &core.Context{Name: name, Args: append([]string(nil), req.Argv[1:]...), RealBinary: path, Dir: req.Dir, Env: append([]string(nil), req.Env...), Ops: ops, Policy: view}
+	args, err := wrapper.Transform(ctx, ctx.Args)
+	if err == nil {
+		ctx.Args = args
+		err = wrapper.Before(ctx)
+	}
+	if err != nil {
+		return protocol.ExecResult{Message: "interposition denied: " + err.Error()}
+	}
+	return protocol.ExecResult{Allowed: true, Path: path, Argv: append([]string{req.Argv[0]}, ctx.Args...), Env: req.Env}
+}
+func (s *server) autoWrapper(path string) (string, core.Wrapper) {
+	name := filepath.Base(path)
+	if filepath.Dir(path) != "/usr/bin" && filepath.Dir(path) != "/bin" {
+		return "", nil
+	}
+	enabled := false
+	for _, configured := range s.policy.AutoInterpose.Commands {
+		if configured == name {
+			enabled = true
+			break
+		}
+	}
+	if !enabled {
+		return "", nil
+	}
+	switch name {
+	case "git":
+		return name, wrappers.Git{}
+	case "find":
+		return name, wrappers.Find{}
+	case "grep":
+		return name, wrappers.Grep{}
+	case "kill", "pkill", "killall", "osascript":
+		return name, wrappers.ProtectedCommand{CommandName: name}
+	}
+	return "", nil
 }
 func (s *server) command(c net.Conn, line string) {
 	if line == "" {

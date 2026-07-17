@@ -19,7 +19,8 @@ int ensure_daemon(void);
 /* Re-register after fork(2). */
 void child_register(void);
 
-/* Policy helpers implemented by the dylib modules. */
+/* Read an unfiltered environment variable through the real getenv. */
+const char *sandbox_rawenv(const char *name);
 bool open_allowed(const char *path, int flags);
 bool is_loopback(const struct sockaddr *addr, socklen_t len);
 

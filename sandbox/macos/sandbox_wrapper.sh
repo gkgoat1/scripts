@@ -12,7 +12,7 @@ if [[ -z "$codesign_identity" ]]; then
   exit 1
 fi
 common_sources=("$root_dir/common/path.c" "$root_dir/common/message.c" "$root_dir/common/socket.c")
-dylib_sources=("$root_dir/macos/dylib/init.c" "$root_dir/macos/dylib/fs.c" "$root_dir/macos/dylib/exec.c" "$root_dir/macos/dylib/env.c" "$root_dir/macos/dylib/net.c")
+dylib_sources=("$root_dir/macos/dylib/init.c" "$root_dir/macos/dylib/fs.c" "$root_dir/macos/dylib/exec.c" "$root_dir/macos/dylib/exec_protocol.c" "$root_dir/macos/dylib/env.c" "$root_dir/macos/dylib/net.c")
 rebuild=0
 if [[ ! -f "$shim" ]]; then
   rebuild=1
