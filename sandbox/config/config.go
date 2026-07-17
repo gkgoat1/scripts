@@ -26,10 +26,24 @@ type HashUpdate struct {
 	AllowResult []string `json:"allowResult"`
 }
 
+type AutoInterposePolicy struct {
+	ExtraProtectedPaths []string              `json:"extraProtectedPaths"`
+	DisableSnapshot     []string              `json:"disableSnapshot"`
+	CommandAllowlist    map[string][][]string `json:"commandAllowlist"`
+}
+
+type AutoInterpose struct {
+	Enabled  bool                `json:"enabled"`
+	Platform string              `json:"platform"`
+	Commands []string            `json:"commands"`
+	Policy   AutoInterposePolicy `json:"policy"`
+}
+
 type Config struct {
 	Version          int                 `json:"version"`
 	EnvironmentAllow map[string][]string `json:"environmentAllow"`
 	HashUpdates      []HashUpdate        `json:"hashUpdates"`
+	AutoInterpose    AutoInterpose       `json:"autoInterpose"`
 }
 
 type Layout struct {
@@ -107,6 +121,34 @@ func (c Config) Validate() error {
 			}
 		}
 	}
+	if c.AutoInterpose.Enabled {
+		if c.AutoInterpose.Platform != "darwin" {
+			return fmt.Errorf("autoInterpose requires platform darwin")
+		}
+		if len(c.AutoInterpose.Commands) == 0 {
+			return fmt.Errorf("autoInterpose requires commands")
+		}
+		allowed := map[string]bool{"git": true, "find": true, "grep": true, "kill": true, "pkill": true, "killall": true, "osascript": true}
+		seen := map[string]bool{}
+		for _, name := range c.AutoInterpose.Commands {
+			if !allowed[name] || seen[name] {
+				return fmt.Errorf("invalid autoInterpose command %q", name)
+			}
+			seen[name] = true
+		}
+		for name, rules := range c.AutoInterpose.Policy.CommandAllowlist {
+			if !allowed[name] {
+				return fmt.Errorf("invalid autoInterpose allowlist command %q", name)
+			}
+			for _, rule := range rules {
+				for _, arg := range rule {
+					if arg == "" || strings.ContainsRune(arg, '\x00') {
+						return fmt.Errorf("invalid autoInterpose allowlist argument")
+					}
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -148,6 +190,9 @@ func canonicalJSON(c Config) ([]byte, error) {
 		sort.Strings(c.HashUpdates[i].Extensions)
 		sort.Strings(c.HashUpdates[i].AllowResult)
 	}
+	sort.Strings(c.AutoInterpose.Commands)
+	sort.Strings(c.AutoInterpose.Policy.ExtraProtectedPaths)
+	sort.Strings(c.AutoInterpose.Policy.DisableSnapshot)
 	return json.Marshal(c)
 }
 

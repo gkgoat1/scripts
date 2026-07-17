@@ -34,6 +34,12 @@ sandbox/run.sh --allow "$PWD/output" --allow-ro "$PWD/input" -- my-program
 
 ## Requirements and limitations
 
+For Linux-specific feature gaps and deferred capabilities (including the fact
+that sandbox-level automatic interposition is not supported on Linux), see
+[`../linux-known-gaps.md`](../linux-known-gaps.md). This launcher rejects a
+sandbox configuration that requests `autoInterpose`; it does not substitute a
+PATH wrapper or another partial implementation.
+
 - Requires Linux user namespaces and mount namespaces. Some distributions disable unprivileged user namespaces; enable the relevant distribution policy or run through an administrator-approved sandbox facility.
 - Requires `unshare`, `mount`, `chroot`, `python3`, and `/proc`.
 - This is filesystem isolation, not a complete security boundary for hostile code. The launcher disables setuid privilege escalation with `no_new_privs`, creates new user/PID/UTS/IPC namespaces, and isolates networking by default, but applications with access to an explicitly allowed host resource can still affect it.

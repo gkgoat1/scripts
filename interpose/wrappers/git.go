@@ -2,14 +2,13 @@ package wrappers
 
 import (
 	"bytes"
+	"context"
 	"fmt"
-	"os"
-	"os/exec"
+	"io"
 	"strings"
 	"time"
 
 	"github.com/gkgoat1/scripts/internal/restoreconflict"
-	"github.com/gkgoat1/scripts/interpose/config"
 	"github.com/gkgoat1/scripts/interpose/core"
 )
 
@@ -33,20 +32,20 @@ func (Git) Before(ctx *core.Context) error {
 	if !needsRestore && !needsSnapshot {
 		return nil
 	}
-	repo, err := gitRepoRoot(ctx.RealBinary, ctx.Args)
+	repo, err := gitRepoRoot(ctx, ctx.Args)
 	if err != nil || repo == "" {
 		return nil
 	}
-	if config.SnapshotsDisabled(repo) {
+	if ctx.Policy.SnapshotsDisabled(repo) {
 		return nil
 	}
 	if needsRestore {
-		if rerr := restoreConflicts(ctx.RealBinary, repo); rerr != nil {
-			fmt.Fprintf(os.Stderr, "[interpose] restore conflict warning: %v\n", rerr)
+		if rerr := restoreConflicts(ctx, repo); rerr != nil {
+			fmt.Fprintf(ctx.Ops.Stderr(), "[interpose] restore conflict warning: %v\n", rerr)
 		}
 	}
 	if needsSnapshot {
-		return gitSnapshot(ctx.RealBinary, repo)
+		return gitSnapshot(ctx, repo)
 	}
 	return nil
 }
@@ -132,14 +131,12 @@ func pathspecArgs(args []string, sub string) []string {
 	return paths
 }
 
-func gitRepoRoot(realGit string, args []string) (string, error) {
+func gitRepoRoot(ctx *core.Context, args []string) (string, error) {
 	gitArgs := []string{"rev-parse", "--show-toplevel"}
 	gitArgs = prependGlobalGitArgs(args, gitArgs)
-	cmd := exec.Command(realGit, gitArgs...)
 	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	_, err := core.RunCommand(ctx, core.Command{Path: ctx.RealBinary, Args: gitArgs, Dir: ctx.Dir, Env: ctx.Env, Stdout: &out, Stderr: ctx.Ops.Stderr()})
+	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(out.String()), nil
@@ -169,36 +166,37 @@ func prependGlobalGitArgs(args, tail []string) []string {
 	return append(out, tail...)
 }
 
-func gitSnapshot(realGit, repo string) error {
-	cfg := config.Load()
-	branch, err := gitOutput(realGit, repo, "rev-parse", "--abbrev-ref", "HEAD")
+func gitSnapshot(ctx *core.Context, repo string) error {
+	branch, err := gitOutput(ctx, repo, "rev-parse", "--abbrev-ref", "HEAD")
 	if err != nil {
 		return nil
 	}
 	if branch == "HEAD" {
 		branch = "detached"
 	}
-	short, err := gitOutput(realGit, repo, "rev-parse", "--short", "HEAD")
+	short, err := gitOutput(ctx, repo, "rev-parse", "--short", "HEAD")
 	if err != nil {
 		return err
 	}
 	ts := time.Now().UTC().Format("20060102-150405")
-	name := fmt.Sprintf("%s/%s_%s_%s", cfg.SnapshotPrefix, ts, sanitizeBranch(branch), short)
-	cmd := exec.Command(realGit, "-C", repo, "branch", name, "HEAD")
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	prefix := ctx.Policy.SnapshotPrefix
+	if prefix == "" {
+		prefix = restoreconflict.DefaultSnapshotPrefix
+	}
+	name := fmt.Sprintf("%s/%s_%s_%s", prefix, ts, sanitizeBranch(branch), short)
+	_, err = core.RunCommand(ctx, core.Command{Path: ctx.RealBinary, Args: []string{"-C", repo, "branch", name, "HEAD"}, Dir: ctx.Dir, Env: ctx.Env, Stderr: ctx.Ops.Stderr()})
+	if err != nil {
 		return fmt.Errorf("snapshot branch: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "[interpose] snapshot: %s\n", name)
+	fmt.Fprintf(ctx.Ops.Stderr(), "[interpose] snapshot: %s\n", name)
 	return nil
 }
 
-func gitOutput(realGit, repo string, args ...string) (string, error) {
+func gitOutput(ctx *core.Context, repo string, args ...string) (string, error) {
 	all := append([]string{"-C", repo}, args...)
-	cmd := exec.Command(realGit, all...)
 	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
+	_, err := core.RunCommand(ctx, core.Command{Path: ctx.RealBinary, Args: all, Dir: ctx.Dir, Env: ctx.Env, Stdout: &out, Stderr: ctx.Ops.Stderr()})
+	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(out.String()), nil
@@ -219,11 +217,25 @@ func sanitizeBranch(name string) string {
 	return name
 }
 
-func restoreConflicts(realGit, repo string) error {
+type gitRunner struct{ ctx *core.Context }
+
+func (r gitRunner) Run(ctx context.Context, command core.Command) (core.Result, error) {
+	return r.ctx.Ops.Run(ctx, command)
+}
+func (r gitRunner) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	return r.ctx.Ops.ReadFile(ctx, path)
+}
+func (r gitRunner) Stderr() io.Writer { return r.ctx.Ops.Stderr() }
+
+func restoreConflicts(ctx *core.Context, repo string) error {
+	prefix := ctx.Policy.SnapshotPrefix
+	if prefix == "" {
+		prefix = restoreconflict.DefaultSnapshotPrefix
+	}
 	return restoreconflict.Restore(repo, restoreconflict.Options{
-		Git:    realGit,
-		Prefix: config.Load().SnapshotPrefix,
-		Out:    os.Stderr,
+		Git:    ctx.RealBinary,
+		Prefix: prefix,
+		Runner: gitRunner{ctx: ctx},
 	})
 }
 

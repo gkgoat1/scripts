@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -108,6 +109,17 @@ func main() {
 				s.cacheDir = layout.TransientRoot
 				cfg, err := sandboxconfig.Load(layout.ConfigPath)
 				if err == nil {
+					if cfg.AutoInterpose.Enabled {
+						if runtime.GOOS != "darwin" {
+							fmt.Fprintln(os.Stderr, "sandbox: autoInterpose is not supported on Linux; see sandbox/linux-known-gaps.md")
+						} else {
+							// Do not permit a committed configuration to imply coverage
+							// before the exec protocol exists. The feature is fail-closed
+							// until the macOS shim/daemon implementation lands.
+							fmt.Fprintln(os.Stderr, "sandbox: autoInterpose macOS exec protocol is not available")
+						}
+						os.Exit(2)
+					}
 					s.policy = cfg
 					proofData, readErr := os.ReadFile(layout.ProofPath)
 					var proof commitment.ProofFile

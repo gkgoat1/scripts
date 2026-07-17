@@ -1,6 +1,7 @@
 package wrappers
 
 import (
+	"path/filepath"
 	"strings"
 
 	"github.com/gkgoat1/scripts/interpose/core"
@@ -12,19 +13,19 @@ type Find struct{}
 
 func (Find) Name() string { return "find" }
 
-func (Find) Transform(_ *core.Context, args []string) ([]string, error) {
+func (Find) Transform(ctx *core.Context, args []string) ([]string, error) {
 	out, bypass := core.StripNoInterpose(args)
 	if bypass {
 		return out, nil
 	}
-	return transformFind(out)
+	return transformFind(ctx, out)
 }
 
 func (Find) Before(_ *core.Context) error { return nil }
 
 func (Find) After(_ *core.Context, _ error) error { return nil }
 
-func transformFind(args []string) ([]string, error) {
+func transformFind(ctx *core.Context, args []string) ([]string, error) {
 	if len(args) == 0 {
 		return args, nil
 	}
@@ -33,8 +34,8 @@ func transformFind(args []string) ([]string, error) {
 		return args, nil
 	}
 	root := args[startIdx]
-	if tcc.WouldTraverseProtected(root) {
-		prunes := buildFindPrunes()
+	if wouldTraverseProtected(ctx, root) {
+		prunes := buildFindPrunes(ctx.Policy.ExtraProtectedPaths)
 		if len(prunes) == 0 {
 			return args, nil
 		}
@@ -60,33 +61,51 @@ func findStartIndex(args []string) int {
 	return len(args)
 }
 
-func buildFindPrunes() []string {
-	var roots []string
-	for _, root := range tcc.ProtectedRoots() {
-		if root != "" {
-			roots = append(roots, root)
-		}
-	}
-	if len(roots) == 0 {
-		return nil
-	}
+func buildFindPrunes(roots []string) []string {
 	var parts []string
-	parts = append(parts, "\\(")
-	for i, root := range roots {
-		if i > 0 {
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		root = filepath.Clean(root)
+		if len(parts) > 1 {
 			parts = append(parts, "-o")
 		}
 		parts = append(parts, "-path", root, "-prune")
 	}
-	parts = append(parts, "\\)")
-	return parts
+	if len(parts) == 0 {
+		return nil
+	}
+	return append(append([]string{"\\("}, parts...), "\\)")
+}
+
+func wouldTraverseProtected(ctx *core.Context, root string) bool {
+	norm, err := tcc.NormalizePath(root)
+	if err != nil {
+		return false
+	}
+	if norm == "/" || norm == ctx.Dir {
+		return true
+	}
+	if ctx.Policy.IsProtected(norm) {
+		return true
+	}
+	for _, protected := range ctx.Policy.ExtraProtectedPaths {
+		protected = filepath.Clean(protected)
+		if strings.HasPrefix(protected, norm+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 // TransformFind exposes find rewriting for tests.
-func TransformFind(args []string) ([]string, error) { return transformFind(args) }
+func TransformFind(args []string) ([]string, error) {
+	return transformFind(core.NewContext("find", nil, ""), args)
+}
 
 // FindWouldRewrite reports whether a protected root scan would be rewritten.
 func FindWouldRewrite(args []string) bool {
-	out, err := transformFind(args)
+	out, err := TransformFind(args)
 	return err == nil && len(out) != len(args)
 }

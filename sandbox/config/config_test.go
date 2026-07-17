@@ -49,3 +49,26 @@ func TestConfigStrictAndAllowsOnlyListedTransition(t *testing.T) {
 		t.Fatal("unknown field accepted")
 	}
 }
+
+func TestAutoInterposeIsStrictlyDarwinAndRegistered(t *testing.T) {
+	c := Config{Version: Version, AutoInterpose: AutoInterpose{
+		Enabled: true, Platform: "darwin", Commands: []string{"git", "kill"},
+		Policy: AutoInterposePolicy{CommandAllowlist: map[string][][]string{"kill": {{"-0", "{pid}"}}}},
+	}}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c.AutoInterpose.Platform = "linux"
+	if err := c.Validate(); err == nil {
+		t.Fatal("accepted Linux autoInterpose")
+	}
+	c.AutoInterpose.Platform = "darwin"
+	c.AutoInterpose.Commands = []string{"git", "git"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("accepted duplicate command")
+	}
+	c.AutoInterpose.Commands = []string{"not-a-wrapper"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("accepted unknown command")
+	}
+}

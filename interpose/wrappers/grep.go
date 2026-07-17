@@ -2,7 +2,6 @@ package wrappers
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -15,19 +14,19 @@ type Grep struct{}
 
 func (Grep) Name() string { return "grep" }
 
-func (Grep) Transform(_ *core.Context, args []string) ([]string, error) {
+func (Grep) Transform(ctx *core.Context, args []string) ([]string, error) {
 	out, bypass := core.StripNoInterpose(args)
 	if bypass {
 		return out, nil
 	}
-	return transformGrep(out)
+	return transformGrep(ctx, out)
 }
 
 func (Grep) Before(_ *core.Context) error { return nil }
 
 func (Grep) After(_ *core.Context, _ error) error { return nil }
 
-func transformGrep(args []string) ([]string, error) {
+func transformGrep(ctx *core.Context, args []string) ([]string, error) {
 	if len(args) == 0 {
 		return args, nil
 	}
@@ -36,7 +35,7 @@ func transformGrep(args []string) ([]string, error) {
 	pathStart := grepPathStart(args)
 	if pathStart >= len(args) {
 		if recursive {
-			return injectGrepExcludes(args), nil
+			return injectGrepExcludes(ctx, args), nil
 		}
 		return args, nil
 	}
@@ -45,17 +44,17 @@ func transformGrep(args []string) ([]string, error) {
 	var dropped []string
 	kept = append(kept, args[:pathStart]...)
 	for _, p := range args[pathStart:] {
-		if tcc.IsProtected(p) || tcc.WouldTraverseProtected(p) {
+		if ctx.Policy.IsProtected(p) || wouldTraverseGrepProtected(ctx, p) {
 			dropped = append(dropped, p)
 			continue
 		}
 		kept = append(kept, p)
 	}
 	for _, p := range dropped {
-		fmt.Fprintf(os.Stderr, "[interpose] grep: skipping protected path %q\n", p)
+		fmt.Fprintf(ctx.Ops.Stderr(), "[interpose] grep: skipping protected path %q\n", p)
 	}
 	if recursive && (len(dropped) > 0 || pathStart == len(args)) {
-		kept = injectGrepExcludes(kept)
+		kept = injectGrepExcludes(ctx, kept)
 	}
 	if len(kept) == pathStart && len(dropped) > 0 {
 		return nil, fmt.Errorf("all path operands are TCC-protected")
@@ -100,11 +99,11 @@ func needsValue(flag string) bool {
 	}
 }
 
-func injectGrepExcludes(args []string) []string {
+func injectGrepExcludes(ctx *core.Context, args []string) []string {
 	pathStart := grepPathStart(args)
 	prefix := append([]string{}, args[:pathStart]...)
 	suffix := append([]string{}, args[pathStart:]...)
-	for _, root := range tcc.ProtectedRoots() {
+	for _, root := range ctx.Policy.ExtraProtectedPaths {
 		base := filepath.Base(root)
 		if base != "" && base != "." {
 			prefix = append(prefix, "--exclude-dir="+base)
@@ -113,5 +112,15 @@ func injectGrepExcludes(args []string) []string {
 	return append(prefix, suffix...)
 }
 
+func wouldTraverseGrepProtected(ctx *core.Context, root string) bool {
+	norm, err := tcc.NormalizePath(root)
+	if err != nil {
+		return false
+	}
+	return norm == "/" || norm == ctx.Dir || ctx.Policy.IsProtected(norm)
+}
+
 // TransformGrep exposes grep rewriting for tests.
-func TransformGrep(args []string) ([]string, error) { return transformGrep(args) }
+func TransformGrep(args []string) ([]string, error) {
+	return transformGrep(core.NewContext("grep", nil, ""), args)
+}

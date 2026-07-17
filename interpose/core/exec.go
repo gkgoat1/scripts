@@ -3,8 +3,6 @@ package core
 import (
 	"fmt"
 	"os"
-	"os/exec"
-	"syscall"
 )
 
 // Wrapper mutates argv and runs hooks around the real binary.
@@ -30,24 +28,15 @@ func (Passthrough) Before(_ *Context) error { return nil }
 
 func (Passthrough) After(_ *Context, _ error) error { return nil }
 
-// Run executes realBinary with args, forwarding stdio and returning exit code.
+// Run executes realBinary with args through the invocation's operation realm.
 func Run(ctx *Context, args []string) (int, error) {
-	cmd := exec.Command(ctx.RealBinary, args...)
-	cmd.Dir = ctx.Dir
-	cmd.Env = ctx.Env
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			if status, ok := ee.Sys().(syscall.WaitStatus); ok {
-				return status.ExitStatus(), nil
-			}
-			return 1, nil
-		}
-		return 1, fmt.Errorf("exec %s: %w", ctx.RealBinary, err)
-	}
-	return 0, nil
+	result, err := RunCommand(ctx, Command{
+		Path: ctx.RealBinary,
+		Args: append([]string(nil), args...),
+		Dir:  ctx.Dir,
+		Env:  append([]string(nil), ctx.Env...),
+	})
+	return result.ExitCode, err
 }
 
 // Execute resolves the real binary, runs wrapper hooks, and exits with the child code.
