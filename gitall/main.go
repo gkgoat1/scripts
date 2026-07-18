@@ -1,5 +1,5 @@
-// Command gitall finds Git repositories and pushes or pulls them to all of
-// their remotes.
+// Command gitall finds Git repositories and pushes or pulls every local branch
+// to all of their remotes.
 //
 // Repositories are discovered in one of two ways:
 //
@@ -14,12 +14,13 @@
 // Local (filesystem) remotes are handled recursively so that a chain of local
 // mirrors syncs end to end:
 //
-//   - push:   each local remote is pulled (recursively) first, then the current
-//     repository is synced and pushed, then each local remote is synced and
-//     pushed (recursively) afterwards. Before each push, gitall fetches the
-//     remote and fast-forwards the current branch when possible.
-//   - pull:   each local remote is pulled (recursively) first, then the current
-//     repository is pulled.
+//   - push:   each local remote is pulled (recursively) first, then every
+//     local branch of the current repository is synced and pushed, then each
+//     local remote is synced and pushed (recursively) afterwards. Before each
+//     branch is pushed, gitall fetches the remote and fast-forwards that branch
+//     when possible.
+//   - pull:   each local remote is pulled (recursively) first, then every local
+//     branch of the current repository is pulled.
 //
 // For example, given ~/work --origin--> ~/mirror --origin--> github.com, a push
 // of ~/work pulls upstream into mirror first, syncs and pushes work, then syncs
@@ -73,10 +74,10 @@ import (
 type MergeMode int
 
 const (
-	mergeNone MergeMode = iota // never merge
-	mergeLocal                 // merge into local (filesystem) remotes only
-	mergeRemote                // merge into local and network remotes
-	mergePR                    // merge into remotes, then fall back to PR on push failure
+	mergeNone   MergeMode = iota // never merge
+	mergeLocal                   // merge into local (filesystem) remotes only
+	mergeRemote                  // merge into local and network remotes
+	mergePR                      // merge into remotes, then fall back to PR on push failure
 )
 
 // expandBareAllowMerge turns a bare "-allow-merge" argument into
@@ -126,11 +127,11 @@ func (m MergeMode) String() string {
 }
 
 type opts struct {
-	mode          string    // "any" or "prtag"
-	action        string    // "push" or "pull"
-	all           bool      // push --all --tags
-	rebase        bool      // pull --rebase
-	commitMsg     string    // if set, commit uncommitted changes before push/pull
+	mode          string // "any" or "prtag"
+	action        string // "push" or "pull"
+	all           bool   // push tags too (all branches are always pushed)
+	rebase        bool   // pull --rebase
+	commitMsg     string // if set, commit uncommitted changes before push/pull
 	dryRun        bool
 	verbose       bool
 	mergeMode     MergeMode     // how to handle non-fast-forward syncs and push failures
@@ -203,7 +204,7 @@ func (o opts) wrapTimeout(ctx context.Context, err error) error {
 
 func main() {
 	mode := flag.String("from", "any", `discovery mode: "any" (dirs with .git) or "prtag" (dirs with a .prtag marker, scanned for repos)`)
-	all := flag.Bool("all", false, "push all branches and tags (push only)")
+	all := flag.Bool("all", false, "push tags too (all branches are always pushed)")
 	rebase := flag.Bool("rebase", false, "pull with --rebase (pull only)")
 	commitMsg := flag.String("m", "", "commit message: if set, commit uncommitted changes before pushing or pulling")
 	timeout := flag.Duration("timeout", 0, "tool timeout: maximum time any single external command may run (e.g. 30s); 0 disables")
@@ -429,8 +430,14 @@ func checkoutHead(repo string, o opts) {
 }
 
 // syncAndPushRepo fetches and fast-forwards (or merges according to mergeMode)
-// from each remote, then pushes. PR fallback runs only when mergeMode >= mergePR
-// and a push to a network remote fails.
+// every local branch from each remote, then pushes every local branch. PR
+// fallback runs only when mergeMode >= mergePR and a push to a network remote
+// fails.
+//
+// Branches are checked out one at a time and the original checkout is restored
+// before returning. This keeps branch histories separate while allowing the
+// same clean-tree, merge, and PR rules that apply to the original branch to
+// apply to every branch.
 //
 // For local remotes, both the sync (fetch/merge into the current repo) and the
 // push into the target repo are protected by the target repo's mutex so that
@@ -453,64 +460,66 @@ func syncAndPushRepo(repo string, clean bool, remotes []string, o opts) bool {
 			}
 		}
 
+		remoteOK := false
+		syncPush := func() {
+			remoteOK = syncAndPushRemote(repo, r, isLocal, o)
+			if !remoteOK {
+				ok = false
+			}
+		}
 		// Lock local remotes while reading/writing them so concurrent
 		// pushes from different source repos do not corrupt refs.
-		var updated bool
-		var err error
 		if isLocal && localPath != "" {
-			o.locks.withLock(localPath, func() {
-				updated, err = o.syncRemote(repo, r, isLocal)
-			})
+			o.locks.withLock(localPath, syncPush)
+			if remoteOK {
+				checkoutHead(localPath, o)
+			}
 		} else {
-			updated, err = o.syncRemote(repo, r, isLocal)
+			syncPush()
 		}
+	}
+	return ok
+}
+
+// syncAndPushRemote synchronizes and pushes each local branch to remote. It
+// intentionally pushes branches individually instead of using `push --all`:
+// that preserves per-branch merge and PR-fallback behavior and lets one
+// unpushable branch be reported without skipping the others.
+func syncAndPushRemote(repo, remote string, isLocal bool, o opts) bool {
+	ok := true
+	if !forEachLocalBranch(repo, o, func(branch string) bool {
+		updated, err := o.syncRemote(repo, remote, isLocal)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[error] %s: sync %s: %v\n", repo, r, err)
-			ok = false
-			continue
+			fmt.Fprintf(os.Stderr, "[error] %s: sync %s (%s): %v\n", repo, remote, branch, err)
+			return false
 		}
 		if updated {
 			checkoutHead(repo, o)
 		}
 
-		fmt.Printf("[push] %s -> %s\n", repo, r)
-		push := func() error {
-			if err := o.git(repo, "push", r); err != nil {
-				return err
-			}
-			if o.all {
-				if err := o.git(repo, "push", r, "--all"); err != nil {
-					return fmt.Errorf("push --all: %w", err)
+		fmt.Printf("[push] %s (%s) -> %s\n", repo, branch, remote)
+		refspec := branch + ":refs/heads/" + branch
+		if err := o.git(repo, "push", remote, refspec); err != nil {
+			if !isLocal && o.mergeMode >= mergePR {
+				if prErr := o.fallbackCreatePR(repo, remote); prErr != nil {
+					fmt.Fprintf(os.Stderr, "[error] %s: push %s (%s): %v\n", repo, remote, branch, err)
+					fmt.Fprintf(os.Stderr, "[error] %s: pr fallback %s (%s): %v\n", repo, remote, branch, prErr)
+					return false
 				}
-				if err := o.git(repo, "push", r, "--tags"); err != nil {
-					return fmt.Errorf("push --tags: %w", err)
-				}
+				return true
 			}
-			return nil
+			fmt.Fprintf(os.Stderr, "[error] %s: push %s (%s): %v\n", repo, remote, branch, err)
+			return false
 		}
-
-		if isLocal && localPath != "" {
-			o.locks.withLock(localPath, func() {
-				if perr := push(); perr != nil {
-					fmt.Fprintf(os.Stderr, "[error] %s: push %s: %v\n", repo, r, perr)
-					ok = false
-					return
-				}
-				checkoutHead(localPath, o)
-			})
-		} else {
-			if perr := push(); perr != nil {
-				if o.mergeMode >= mergePR {
-					if prErr := o.fallbackCreatePR(repo, r); prErr != nil {
-						fmt.Fprintf(os.Stderr, "[error] %s: push %s: %v\n", repo, r, perr)
-						fmt.Fprintf(os.Stderr, "[error] %s: pr fallback %s: %v\n", repo, r, prErr)
-						ok = false
-					}
-				} else {
-					fmt.Fprintf(os.Stderr, "[error] %s: push %s: %v\n", repo, r, perr)
-					ok = false
-				}
-			}
+		return true
+	}) {
+		ok = false
+	}
+	if o.all {
+		fmt.Printf("[push] %s (tags) -> %s\n", repo, remote)
+		if err := o.git(repo, "push", remote, "--tags"); err != nil {
+			fmt.Fprintf(os.Stderr, "[error] %s: push tags %s: %v\n", repo, remote, err)
+			ok = false
 		}
 	}
 	return ok
@@ -582,9 +591,121 @@ func (o opts) remoteBranchExists(repo, ref string) bool {
 	return err == nil
 }
 
-// pullRepo pulls the current repository from all remotes when it is clean.
-// After each successful pull, it checks out HEAD so the working tree matches
-// the (possibly moved) HEAD.
+// localBranches returns all local branch names in a stable order. Unlike the
+// checked-out branch, each of these is explicitly synchronized so a feature
+// branch cannot be silently left behind when another branch is active.
+func (o opts) localBranches(repo string) ([]string, error) {
+	out, err := o.capture(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads")
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(out), nil
+}
+
+// remoteBranches returns the branch names advertised by remote after it has
+// been fetched. The symbolic <remote>/HEAD ref is deliberately excluded.
+func (o opts) remoteBranches(repo, remote string) ([]string, error) {
+	out, err := o.capture(repo, "for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/"+remote)
+	if err != nil {
+		return nil, err
+	}
+	var branches []string
+	for _, branch := range strings.Fields(out) {
+		if branch != "HEAD" {
+			branches = append(branches, branch)
+		}
+	}
+	return branches, nil
+}
+
+func (o opts) localBranchExists(repo, branch string) bool {
+	_, err := o.capture(repo, "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+	return err == nil
+}
+
+// createTrackingBranches materializes any branch present only on a remote as a
+// local tracking branch. Fetch alone leaves such a ref under refs/remotes and
+// a later local-remote hop would not push it onward; creating the branch makes
+// complete branch propagation through a chain possible.
+func (o opts) createTrackingBranches(repo, remote string) error {
+	branches, err := o.remoteBranches(repo, remote)
+	if err != nil {
+		return err
+	}
+	for _, branch := range branches {
+		if o.localBranchExists(repo, branch) {
+			continue
+		}
+		fmt.Printf("[track] %s: %s from %s\n", repo, branch, remote)
+		if err := o.git(repo, "branch", "--track", branch, remote+"/"+branch); err != nil {
+			return fmt.Errorf("create tracking branch %s: %w", branch, err)
+		}
+	}
+	return nil
+}
+
+// forEachLocalBranch checks out every local branch in turn, runs f, then
+// restores the exact original checkout (including a detached HEAD). A clean
+// worktree is required by the caller, so switching branches cannot overwrite
+// uncommitted work. Bare repositories need no checkout and can still push
+// every ref; syncRemote consequently treats their per-branch sync as a no-op.
+func forEachLocalBranch(repo string, o opts, f func(branch string) bool) bool {
+	bare, err := o.isBare(repo)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[error] %s: detect bare repository: %v\n", repo, err)
+		return false
+	}
+	branches, err := o.localBranches(repo)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[error] %s: list local branches: %v\n", repo, err)
+		return false
+	}
+	if len(branches) == 0 {
+		return true
+	}
+	if bare {
+		ok := true
+		for _, branch := range branches {
+			if !f(branch) {
+				ok = false
+			}
+		}
+		return ok
+	}
+
+	originalBranch, branchErr := o.currentBranch(repo)
+	originalHead, headErr := o.capture(repo, "rev-parse", "HEAD")
+	if headErr != nil {
+		fmt.Fprintf(os.Stderr, "[error] %s: record original HEAD: %v\n", repo, headErr)
+		return false
+	}
+	originalHead = strings.TrimSpace(originalHead)
+	ok := true
+	for _, branch := range branches {
+		if err := o.git(repo, "checkout", branch); err != nil {
+			fmt.Fprintf(os.Stderr, "[error] %s: checkout %s: %v\n", repo, branch, err)
+			ok = false
+			continue
+		}
+		if !f(branch) {
+			ok = false
+		}
+	}
+	if branchErr == nil && originalBranch != "HEAD" {
+		if err := o.git(repo, "checkout", originalBranch); err != nil {
+			fmt.Fprintf(os.Stderr, "[error] %s: restore branch %s: %v\n", repo, originalBranch, err)
+			ok = false
+		}
+	} else if err := o.git(repo, "checkout", "--detach", originalHead); err != nil {
+		fmt.Fprintf(os.Stderr, "[error] %s: restore detached HEAD %s: %v\n", repo, originalHead, err)
+		ok = false
+	}
+	return ok
+}
+
+// pullRepo pulls every local branch from every remote when it is clean. Each
+// branch is checked out and restored by forEachLocalBranch, preventing commits
+// from one branch from being merged or rebased into another.
 func pullRepo(repo string, clean bool, remotes []string, o opts) bool {
 	if !clean {
 		fmt.Printf("[skip] %s: uncommitted changes\n", repo)
@@ -592,18 +713,39 @@ func pullRepo(repo string, clean bool, remotes []string, o opts) bool {
 	}
 	ok := true
 	for _, r := range remotes {
-		fmt.Printf("[pull] %s <- %s\n", repo, r)
-		args := []string{"pull"}
-		if o.rebase {
-			args = append(args, "--rebase")
-		}
-		args = append(args, r)
-		if err := o.git(repo, args...); err != nil {
-			fmt.Fprintf(os.Stderr, "[error] %s: pull %s: %v\n", repo, r, err)
+		// Fetch once before enumerating branches. This both refreshes existing
+		// tracking refs and lets branches created upstream be materialized below.
+		if err := o.git(repo, "fetch", r); err != nil {
+			fmt.Fprintf(os.Stderr, "[error] %s: fetch %s: %v\n", repo, r, err)
 			ok = false
 			continue
 		}
-		checkoutHead(repo, o)
+		if err := o.createTrackingBranches(repo, r); err != nil {
+			fmt.Fprintf(os.Stderr, "[error] %s: track branches from %s: %v\n", repo, r, err)
+			ok = false
+			continue
+		}
+		if !forEachLocalBranch(repo, o, func(branch string) bool {
+			ref := r + "/" + branch
+			if !o.remoteBranchExists(repo, ref) {
+				fmt.Printf("[skip] %s: pull %s: no remote branch %s\n", repo, r, branch)
+				return true
+			}
+			fmt.Printf("[pull] %s (%s) <- %s\n", repo, branch, r)
+			args := []string{"pull"}
+			if o.rebase {
+				args = append(args, "--rebase")
+			}
+			args = append(args, r, branch)
+			if err := o.git(repo, args...); err != nil {
+				fmt.Fprintf(os.Stderr, "[error] %s: pull %s (%s): %v\n", repo, r, branch, err)
+				return false
+			}
+			checkoutHead(repo, o)
+			return true
+		}) {
+			ok = false
+		}
 	}
 	return ok
 }

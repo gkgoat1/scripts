@@ -67,6 +67,24 @@ func readHead(t *testing.T, repo string) string {
 	return strings.TrimSpace(string(out))
 }
 
+func readBranchHead(t *testing.T, repo, branch string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", repo, "rev-parse", branch).Output()
+	if err != nil {
+		t.Fatalf("rev-parse %s in %s: %v", branch, repo, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func currentBranchName(t *testing.T, repo string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", repo, "branch", "--show-current").Output()
+	if err != nil {
+		t.Fatalf("current branch in %s: %v", repo, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func TestPushPullRecursion(t *testing.T) {
 	work, mirror, upstream := buildChain(t)
 
@@ -98,6 +116,54 @@ func TestPushPullRecursion(t *testing.T) {
 	}
 	if got := readHead(t, work); got != upHead {
 		t.Errorf("work HEAD after pull = %s, want %s", got, upHead)
+	}
+}
+
+func TestPushPullAllBranches(t *testing.T) {
+	work, mirror, upstream := buildChain(t)
+	base := currentBranchName(t, work)
+
+	// Create a feature branch locally while leaving the base branch checked
+	// out. A normal gitall push must propagate both refs through the complete
+	// local-remote chain without merging the feature commit into base.
+	mustRun(t, work, "git", "checkout", "-q", "-b", "feature")
+	mustWrite(t, filepath.Join(work, "feature.txt"), "work feature\n")
+	mustRun(t, work, "git", "add", "-A")
+	mustRun(t, work, "git", "commit", "-q", "-m", "work feature")
+	featureHead := readHead(t, work)
+	mustRun(t, work, "git", "checkout", "-q", base)
+
+	if code := run([]string{"push", work}); code != 0 {
+		t.Fatalf("gitall multi-branch push exit %d", code)
+	}
+	for _, repo := range []string{mirror, upstream} {
+		if got := readBranchHead(t, repo, "feature"); got != featureHead {
+			t.Errorf("%s feature = %s, want %s", repo, got, featureHead)
+		}
+	}
+	if got := currentBranchName(t, work); got != base {
+		t.Errorf("work left on %s, want original branch %s", got, base)
+	}
+
+	// Advance the remote feature branch, then pull from the base checkout.
+	// Both downstream repositories must receive that feature-only commit, and
+	// the base branch must remain the checked-out branch in work.
+	mustRun(t, upstream, "git", "checkout", "-q", "feature")
+	mustWrite(t, filepath.Join(upstream, "feature.txt"), "upstream feature\n")
+	mustRun(t, upstream, "git", "commit", "-q", "-am", "upstream feature")
+	upstreamFeatureHead := readHead(t, upstream)
+	mustRun(t, upstream, "git", "checkout", "-q", base)
+
+	if code := run([]string{"pull", work}); code != 0 {
+		t.Fatalf("gitall multi-branch pull exit %d", code)
+	}
+	for _, repo := range []string{mirror, work} {
+		if got := readBranchHead(t, repo, "feature"); got != upstreamFeatureHead {
+			t.Errorf("%s feature after pull = %s, want %s", repo, got, upstreamFeatureHead)
+		}
+	}
+	if got := currentBranchName(t, work); got != base {
+		t.Errorf("work left on %s after pull, want original branch %s", got, base)
 	}
 }
 

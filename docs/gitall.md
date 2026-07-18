@@ -18,7 +18,7 @@ If no roots are given, `.` is used.
 | Flag | Default | Meaning |
 |------|---------|----------|
 | `-from` | `any` | Discovery mode: `any` (every `.git` directory) or `prtag` (`.prtag` project markers). |
-| `-all` | false | Push all branches and tags (`push` only). |
+| `-all` | false | Push tags too; all local branches are always pushed. |
 | `-rebase` | false | Pull with `--rebase` (`pull` only). |
 | `-m` | `""` | Commit message; if set, stage and commit uncommitted changes before push/pull. |
 | `-n` | false | Dry run: print actions without running `git`. |
@@ -35,14 +35,29 @@ If no roots are given, `.` is used.
 - `-from prtag`: directories containing a `.prtag` marker are treated as
   project roots and scanned for nested repositories. See `docs/prtag.md`.
 
+`gitall` synchronizes every local branch, not just the currently checked-out
+branch. Before each branch is pushed, it is fetched and fast-forwarded (or
+merged when enabled) from the corresponding branch on each remote; each branch
+is then pushed explicitly. Pulls likewise fetch and pull every local branch.
+Branches which do not yet exist on a remote are safely skipped while pulling
+and created while pushing.
+
+Repositories must still be clean unless `-m` is supplied. `gitall` temporarily
+checks out branches one at a time and restores the original branch (or detached
+`HEAD`) when finished, so commits are never accidentally merged, rebased, or
+pushed as a different branch.
+
+`-all` remains available to push tags in addition to this default all-branch
+behavior.
+
 ## Local-remote chains
 
 Local remotes are resolved and handled recursively. Given a chain such as
 `~/work -> ~/mirror -> github.com`:
 
-- `gitall push`: pulls upstream into mirror, syncs and pushes work, then syncs
-  and pushes mirror to GitHub.
-- `gitall pull`: pulls the chain in the opposite direction.
+- `gitall push`: pulls upstream into mirror, syncs and pushes every branch in
+  work, then syncs and pushes every branch in mirror to GitHub.
+- `gitall pull`: pulls every branch through the chain in the opposite direction.
 
 Cycles are prevented by tracking repositories on the current recursion path.
 
