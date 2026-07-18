@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 DEST="${HOME}/.local/bin/pulse"
 CONFIG="${HOME}/.config/pulse/jobs"
+TASKS_CONFIG="${HOME}/.config/pulse/tasks"
 
 UNINSTALL=0
 for arg in "$@"; do
@@ -41,6 +42,19 @@ EOF
   echo "(Not loading it now — an empty config would make pulse exit immediately and"
   echo " launchd would keep restarting it in a crash loop.)"
   exit 0
+fi
+
+if [ ! -f "$TASKS_CONFIG" ]; then
+  cat >"$TASKS_CONFIG" <<'EOF'
+# Pulse v2 task domains — see docs/pulse-task-domains-plan.md
+#
+# task: event-drainer
+# domain: rapid-service
+# command: event-drainer --one-batch
+# restart: always
+# restart-min-delay: 0s
+EOF
+  echo "Created a v2 task template at ${TASKS_CONFIG}."
 fi
 
 launchagent_install pulse "$DEST" -config "$CONFIG"

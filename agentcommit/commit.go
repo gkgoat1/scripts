@@ -11,6 +11,7 @@ import (
 	interposeconfig "github.com/gkgoat1/scripts/interpose/config"
 	interposecommand "github.com/gkgoat1/scripts/interpose/policy/command"
 	pconfig "github.com/gkgoat1/scripts/pulse/config"
+	tasks "github.com/gkgoat1/scripts/pulse/tasks"
 	sandboxconfig "github.com/gkgoat1/scripts/sandbox/config"
 )
 
@@ -21,7 +22,14 @@ import (
 // goes to errw; out receives ONLY the hex root, so this is $(...)-capturable
 // by install-agentcommit-anchor.sh.
 func runCommit(pulseConfigPath string, out, errw io.Writer) ([32]byte, error) {
+	return runCommitWithTasks(pulseConfigPath, tasks.DefaultConfigPath(), out, errw)
+}
+
+// runCommitWithTasks gathers legacy Pulse jobs and v2 domain-separated tasks.
+// It is split from runCommit so existing callers retain the legacy signature.
+func runCommitWithTasks(pulseConfigPath, tasksConfigPath string, out, errw io.Writer) ([32]byte, error) {
 	var pulseLeaves []commitment.Leaf
+	var taskLeaves []commitment.Leaf
 
 	jobs, jerr := pconfig.LoadConfig(pulseConfigPath)
 	switch {
@@ -34,6 +42,21 @@ func runCommit(pulseConfigPath string, out, errw io.Writer) ([32]byte, error) {
 		fmt.Fprintf(errw, "[skip] pulse: no config found at %s\n", pulseConfigPath)
 	default:
 		return [32]byte{}, fmt.Errorf("pulse: %w", jerr)
+	}
+
+	loadedTasks, terr := tasks.LoadConfig(tasksConfigPath)
+	switch {
+	case terr == nil:
+		counts := map[tasks.Domain]int{}
+		for _, task := range loadedTasks {
+			taskLeaves = append(taskLeaves, task.CommitLeaf())
+			counts[task.Domain]++
+		}
+		fmt.Fprintf(errw, "[commit] pulse tasks: %d scheduled, %d user, %d service, %d rapid-service, %d stoppable-service, %d disabled from %s\n", counts[tasks.Scheduled], counts[tasks.User], counts[tasks.Service], counts[tasks.RapidService], counts[tasks.StoppableService], counts[tasks.Disabled], tasksConfigPath)
+	case errors.Is(terr, os.ErrNotExist):
+		fmt.Fprintf(errw, "[skip] pulse tasks: no config found at %s\n", tasksConfigPath)
+	default:
+		return [32]byte{}, fmt.Errorf("pulse tasks: %w", terr)
 	}
 
 	policy := interposeconfig.Load().CommitLeaf()
@@ -55,8 +78,9 @@ func runCommit(pulseConfigPath string, out, errw io.Writer) ([32]byte, error) {
 		return [32]byte{}, fmt.Errorf("sandbox: %w", serr)
 	}
 
-	all := make([]commitment.Leaf, 0, len(pulseLeaves)+2+len(sandboxLeaves))
+	all := make([]commitment.Leaf, 0, len(pulseLeaves)+len(taskLeaves)+2+len(sandboxLeaves))
 	all = append(all, pulseLeaves...)
+	all = append(all, taskLeaves...)
 	all = append(all, policy, commandLeaf)
 	all = append(all, sandboxLeaves...)
 
@@ -69,6 +93,11 @@ func runCommit(pulseConfigPath string, out, errw io.Writer) ([32]byte, error) {
 	if len(pulseLeaves) > 0 {
 		if err := writeProofSidecar(tree, root, pulseLeaves, pulseConfigPath+".proof"); err != nil {
 			return [32]byte{}, fmt.Errorf("pulse: %w", err)
+		}
+	}
+	if len(taskLeaves) > 0 {
+		if err := writeProofSidecar(tree, root, taskLeaves, tasksConfigPath+".proof"); err != nil {
+			return [32]byte{}, fmt.Errorf("pulse tasks: %w", err)
 		}
 	}
 	if err := writeProofSidecar(tree, root, []commitment.Leaf{policy}, interposeconfig.DefaultConfigPath()+".proof"); err != nil {
@@ -88,8 +117,9 @@ func runCommit(pulseConfigPath string, out, errw io.Writer) ([32]byte, error) {
 	return root, nil
 }
 
-// writeProofSidecar writes a ProofFile covering exactly leaves (keyed by
-// Leaf.ID) to path, atomically.
+// writeProofSidecar writes a ProofFile covering exactly leaves, keyed by each
+// leaf's complete canonical key.  The full key prevents a proof for one Pulse
+// task domain from being reused for another with the same human-facing ID.
 func writeProofSidecar(tree *commitment.Tree, root [32]byte, leaves []commitment.Leaf, path string) error {
 	entries := make(map[string]commitment.Proof, len(leaves))
 	for _, l := range leaves {
@@ -97,7 +127,7 @@ func writeProofSidecar(tree *commitment.Tree, root [32]byte, leaves []commitment
 		if err != nil {
 			return err
 		}
-		entries[l.ID] = proof
+		entries[l.Key()] = proof
 	}
 	data := commitment.EncodeProofFile(root, entries)
 	return atomicWriteFile(path, data)

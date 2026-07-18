@@ -40,7 +40,7 @@ func verifyPolicy(cfg interposeconfig.Config, reader anchor.AnchorReader, proof 
 	}
 
 	leaf := cfg.CommitLeaf()
-	p, ok := proof.Entries[interposeconfig.PolicyLeafID]
+	p, ok := proof.Entries[cfg.CommitLeaf().Key()]
 	if !ok || !commitment.VerifyProof(leaf, p, root) {
 		return nil, false, "policy commitment verification failed; enforcing built-in defaults only"
 	}

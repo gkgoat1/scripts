@@ -19,7 +19,7 @@ func TestCommitFileEncodeDecodeRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ProofFor: %v", err)
 		}
-		entries[l.ID] = p
+		entries[l.Key()] = p
 	}
 
 	data := EncodeProofFile(root, entries)
@@ -34,7 +34,7 @@ func TestCommitFileEncodeDecodeRoundTrip(t *testing.T) {
 		t.Fatalf("Entries = %d, want %d", len(pf.Entries), len(entries))
 	}
 	for _, l := range leaves {
-		proof, ok := pf.Entries[l.ID]
+		proof, ok := pf.Entries[l.Key()]
 		if !ok {
 			t.Fatalf("missing entry for %q", l.ID)
 		}
@@ -65,7 +65,7 @@ func TestCommitFileRoundTripPreservesCarryStep(t *testing.T) {
 				sawCarry = true
 			}
 		}
-		entries[l.ID] = p
+		entries[l.Key()] = p
 	}
 	if !sawCarry {
 		t.Fatal("test setup: expected at least one Carry step across a 3-leaf tree")
@@ -77,7 +77,7 @@ func TestCommitFileRoundTripPreservesCarryStep(t *testing.T) {
 		t.Fatalf("DecodeProofFile: %v", err)
 	}
 	for _, l := range leaves {
-		if !VerifyProof(l, pf.Entries[l.ID], root) {
+		if !VerifyProof(l, pf.Entries[l.Key()], root) {
 			t.Errorf("round-tripped proof for %q (with a Carry step) does not verify", l.ID)
 		}
 	}

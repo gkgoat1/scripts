@@ -85,7 +85,18 @@ func TestSignalShutsDownCleanlyAfterInFlightCommand(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 
-	time.Sleep(200 * time.Millisecond) // let a few ticks fire
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(stdout.String(), "[start] pulse:") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !strings.Contains(stdout.String(), "[start] pulse:") {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("pulse did not reach startup before signal; output:\n%s", stdout.String())
+	}
+	// Do not signal until main has installed signal.NotifyContext; otherwise
+	// the OS may deliver SIGINT's default action during process startup.
+	time.Sleep(100 * time.Millisecond)
 	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
 		t.Fatalf("signal: %v", err)
 	}

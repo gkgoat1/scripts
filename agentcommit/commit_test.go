@@ -88,7 +88,7 @@ func TestRunCommitWritesSidecarsAndPrintsMatchingRoot(t *testing.T) {
 		t.Fatalf("decode pulse proof sidecar: %v", err)
 	}
 	for _, j := range jobs {
-		proof, ok := pulsePF.Entries[j.Name]
+		proof, ok := pulsePF.Entries[j.CommitLeaf().Key()]
 		if !ok {
 			t.Fatalf("no proof entry for job %q", j.Name)
 		}
@@ -106,7 +106,7 @@ func TestRunCommitWritesSidecarsAndPrintsMatchingRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode interpose proof sidecar: %v", err)
 	}
-	policyProof, ok := interposePF.Entries[interposeconfig.PolicyLeafID]
+	policyProof, ok := interposePF.Entries[interposeconfig.Load().CommitLeaf().Key()]
 	if !ok {
 		t.Fatal("no policy proof entry")
 	}
@@ -122,7 +122,7 @@ func TestRunCommitWritesSidecarsAndPrintsMatchingRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode command-policy proof sidecar: %v", err)
 	}
-	commandProof, ok := commandPF.Entries[interposecommand.PolicyLeafID]
+	commandProof, ok := commandPF.Entries[commandPolicy.CommitLeaf().Key()]
 	if !ok {
 		t.Fatal("no command-policy proof entry")
 	}

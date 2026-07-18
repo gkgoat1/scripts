@@ -33,7 +33,7 @@ func Verify(path string, reader anchor.AnchorReader) (Allowlist, error) {
 	if err != nil {
 		return list, fmt.Errorf("decode command-policy proof: %w", err)
 	}
-	proof, ok := proofFile.Entries[PolicyLeafID]
+	proof, ok := proofFile.Entries[list.CommitLeaf().Key()]
 	if !ok || !commitment.VerifyProof(list.CommitLeaf(), proof, root) {
 		return list, fmt.Errorf("command allowlist commitment verification failed")
 	}

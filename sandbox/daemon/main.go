@@ -133,7 +133,7 @@ func main() {
 						// local config for tests, but never shares the committed cache.
 						s.policyActive = true
 					case anchorErr == nil && proofErr == nil:
-						if p, ok := proof.Entries[sandboxconfig.PolicyLeafID]; ok && commitment.VerifyProof(cfg.CommitLeaf(), p, root) {
+						if p, ok := proof.Entries[cfg.CommitLeaf().Key()]; ok && commitment.VerifyProof(cfg.CommitLeaf(), p, root) {
 							s.policyActive, s.policyTrusted, s.cacheDir = true, true, layout.CacheDir
 						}
 					}

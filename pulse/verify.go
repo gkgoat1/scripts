@@ -46,7 +46,7 @@ func (v realCommitmentVerifier) Verify(job pconfig.Job) (ok bool, reason string,
 	if derr != nil {
 		return false, fmt.Sprintf("invalid commitment proof file (%v)", derr), nil
 	}
-	proof, found := pf.Entries[job.Name]
+	proof, found := pf.Entries[job.CommitLeaf().Key()]
 	if !found {
 		return false, "no commitment proof entry for this job", nil
 	}

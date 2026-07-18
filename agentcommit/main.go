@@ -11,6 +11,7 @@ import (
 	"os"
 
 	pconfig "github.com/gkgoat1/scripts/pulse/config"
+	tasks "github.com/gkgoat1/scripts/pulse/tasks"
 )
 
 func main() {
@@ -35,7 +36,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage: agentcommit <commit|anchor> [flags]\n\n")
-	fmt.Fprintf(os.Stderr, "  commit [-pulse-config path]   recompute the commitment tree, write proof sidecars, print the hex root\n")
+	fmt.Fprintf(os.Stderr, "  commit [-pulse-config path] [-pulse-tasks-config path]   recompute the commitment tree, write proof sidecars, print the hex root\n")
 	fmt.Fprintf(os.Stderr, "  anchor -root <hex>            the anchor LaunchAgent's ProgramArguments target; validates and exits\n\n")
 	fmt.Fprintf(os.Stderr, "See docs/agentcommit.md.\n")
 }
@@ -43,11 +44,12 @@ func usage() {
 func runCommitCLI(args []string) {
 	fs := flag.NewFlagSet("commit", flag.ContinueOnError)
 	pulseConfigPath := fs.String("pulse-config", pconfig.DefaultConfigPath(), "path to pulse's job config")
+	tasksConfigPath := fs.String("pulse-tasks-config", tasks.DefaultConfigPath(), "path to Pulse v2 task config")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
 
-	if _, err := runCommit(*pulseConfigPath, os.Stdout, os.Stderr); err != nil {
+	if _, err := runCommitWithTasks(*pulseConfigPath, *tasksConfigPath, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "[error] %v\n", err)
 		os.Exit(1)
 	}

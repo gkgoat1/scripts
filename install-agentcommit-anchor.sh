@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 DEST="${HOME}/.local/bin/agentcommit"
 PULSE_CONFIG="${HOME}/.config/pulse/jobs"
+PULSE_TASKS_CONFIG="${HOME}/.config/pulse/tasks"
 
 UNINSTALL=0
 for arg in "$@"; do
@@ -29,7 +30,7 @@ echo "Building agentcommit..."
 go build -o "$DEST" "${ROOT}/agentcommit"
 
 echo "Committing the current spawnable-command and policy config..."
-root="$("$DEST" commit -pulse-config "$PULSE_CONFIG")"
+root="$("$DEST" commit -pulse-config "$PULSE_CONFIG" -pulse-tasks-config "$PULSE_TASKS_CONFIG")"
 
 launchagent_install agentcommit-anchor "$DEST" anchor -root "$root"
 

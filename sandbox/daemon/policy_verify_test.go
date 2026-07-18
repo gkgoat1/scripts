@@ -72,7 +72,7 @@ func TestVerifyPolicyVerifiedOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProofFor: %v", err)
 	}
-	pf := commitment.ProofFile{Entries: map[string]commitment.Proof{interposeconfig.PolicyLeafID: proof}}
+	pf := commitment.ProofFile{Entries: map[string]commitment.Proof{cfg.CommitLeaf().Key(): proof}}
 
 	extra, trusted, msg := verifyPolicy(cfg, fakeAnchorReader{root: tree.Root()}, pf, nil)
 
@@ -97,7 +97,7 @@ func TestVerifyPolicyTamperedConfigFallsBackToDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProofFor: %v", err)
 	}
-	pf := commitment.ProofFile{Entries: map[string]commitment.Proof{interposeconfig.PolicyLeafID: proof}}
+	pf := commitment.ProofFile{Entries: map[string]commitment.Proof{original.CommitLeaf().Key(): proof}}
 
 	// Attacker narrowed ExtraProtectedPaths after the commitment was made.
 	tampered := interposeconfig.Config{}
