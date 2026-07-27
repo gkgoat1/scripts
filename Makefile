@@ -1,4 +1,4 @@
-.PHONY: test test-go test-shell coverage build-interpose build-pulse fmt fmt-check
+.PHONY: test test-go test-shell coverage build-archive-repack build-interpose build-pulse fmt fmt-check
 
 test: test-go test-shell
 
@@ -14,6 +14,9 @@ test-shell:
 
 coverage: test-go
 	go tool cover -func=coverage.out
+
+build-archive-repack:
+	go build -o bin/archive-repack ./archive-repack
 
 build-interpose:
 	go build -o bin/interpose ./interpose
