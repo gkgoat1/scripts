@@ -573,8 +573,16 @@ func (o opts) syncRemote(repo, remote string, isLocal bool) (bool, error) {
 		}
 		fmt.Printf("[merge] %s: %s/%s\n", repo, remote, branch)
 		if err := o.git(repo, "merge", ref, "-m", msg, "--no-ff"); err != nil {
-			o.git(repo, "merge", "--abort")
-			return false, fmt.Errorf("merge: %w", err)
+			resolved, resolveErr := o.resolveCargoLockConflicts(repo)
+			if resolveErr == nil && resolved {
+				// resolveCargoLockConflicts completed the pending merge.
+			} else {
+				o.git(repo, "merge", "--abort")
+				if resolveErr != nil {
+					return false, fmt.Errorf("resolve Cargo.lock conflicts: %w", resolveErr)
+				}
+				return false, fmt.Errorf("merge: %w", err)
+			}
 		}
 	}
 
@@ -584,6 +592,44 @@ func (o opts) syncRemote(repo, remote string, isLocal bool) (bool, error) {
 	}
 	afterHead = strings.TrimSpace(afterHead)
 	return beforeHead != afterHead, nil
+}
+
+// resolveCargoLockConflicts removes every conflicted Cargo.lock file and
+// completes the pending merge if that resolves all conflicts. It returns false
+// without changing the merge state when no Cargo.lock files are conflicted, or
+// when other conflicts remain after their removal.
+func (o opts) resolveCargoLockConflicts(repo string) (bool, error) {
+	out, err := o.capture(repo, "diff", "--name-only", "--diff-filter=U", "-z")
+	if err != nil {
+		return false, err
+	}
+
+	var locks []string
+	for _, path := range bytes.Split([]byte(out), []byte{0}) {
+		if len(path) == 0 || filepath.Base(string(path)) != "Cargo.lock" {
+			continue
+		}
+		locks = append(locks, string(path))
+	}
+	if len(locks) == 0 {
+		return false, nil
+	}
+
+	if err := o.git(repo, append([]string{"rm", "-f", "--"}, locks...)...); err != nil {
+		return false, err
+	}
+	out, err = o.capture(repo, "diff", "--name-only", "--diff-filter=U", "-z")
+	if err != nil {
+		return false, err
+	}
+	if len(bytes.Trim([]byte(out), "\x00")) != 0 {
+		return false, nil
+	}
+
+	if err := o.git(repo, "commit", "--no-edit"); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (o opts) remoteBranchExists(repo, ref string) bool {

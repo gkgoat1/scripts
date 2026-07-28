@@ -433,6 +433,92 @@ func TestPushAllowMergeConflict(t *testing.T) {
 	_ = mirror
 }
 
+func TestPushAllowMergeDropsCargoLockConflicts(t *testing.T) {
+	work, mirror, upstream := buildChain(t)
+	unconflictedPath := filepath.Join("docs", "Cargo.lock")
+	if err := os.MkdirAll(filepath.Join(work, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(work, unconflictedPath), "unchanged\n")
+	mustRun(t, work, "git", "add", "-A")
+	mustRun(t, work, "git", "commit", "-q", "-m", "add unconflicted lockfile")
+	if code := run([]string{"push", work}); code != 0 {
+		t.Fatalf("setup push exit %d", code)
+	}
+	paths := []string{"Cargo.lock", filepath.Join("crates", "nested", "Cargo.lock")}
+	divergentCargoLockConflicts(t, work, mirror, paths...)
+
+	if code := run([]string{"-allow-merge", "push", work}); code != 0 {
+		t.Fatalf("gitall -allow-merge push exit %d", code)
+	}
+	for _, repo := range []string{work, mirror, upstream} {
+		for _, path := range paths {
+			if _, err := os.Stat(filepath.Join(repo, path)); !os.IsNotExist(err) {
+				t.Errorf("%s still exists in %s after merge (err=%v)", path, repo, err)
+			}
+		}
+	}
+	if out, err := exec.Command("git", "-C", work, "rev-list", "--parents", "-n", "1", "HEAD").Output(); err != nil {
+		t.Fatal(err)
+	} else if len(strings.Fields(string(out))) != 3 {
+		t.Errorf("HEAD is not a merge commit: %s", out)
+	}
+	for _, repo := range []string{work, mirror, upstream} {
+		if got, err := os.ReadFile(filepath.Join(repo, unconflictedPath)); err != nil {
+			t.Errorf("read unconflicted Cargo.lock in %s: %v", repo, err)
+		} else if string(got) != "unchanged\n" {
+			t.Errorf("unconflicted Cargo.lock in %s = %q, want unchanged", repo, got)
+		}
+	}
+}
+
+func TestPushAllowMergeAbortsWhenCargoLockAndOtherConflictsRemain(t *testing.T) {
+	work, mirror, _ := buildChain(t)
+	divergentCargoLockConflicts(t, work, mirror, "Cargo.lock")
+	mustWrite(t, filepath.Join(mirror, "f.txt"), "mirror conflict\n")
+	mustRun(t, mirror, "git", "commit", "-q", "-am", "mirror normal conflict")
+	mustWrite(t, filepath.Join(work, "f.txt"), "work conflict\n")
+	mustRun(t, work, "git", "commit", "-q", "-am", "work normal conflict")
+	workHead := readHead(t, work)
+
+	if code := run([]string{"-allow-merge", "push", work}); code == 0 {
+		t.Fatal("expected non-zero exit when a non-Cargo.lock conflict remains")
+	}
+	if got := readHead(t, work); got != workHead {
+		t.Errorf("work HEAD changed despite unresolved conflict: %s -> %s", workHead, got)
+	}
+	if out, err := exec.Command("git", "-C", work, "status", "--porcelain").Output(); err != nil {
+		t.Fatal(err)
+	} else if got := strings.TrimSpace(string(out)); got != "" {
+		t.Errorf("work tree not clean after aborted merge: %s", got)
+	}
+}
+
+func divergentCargoLockConflicts(t *testing.T, work, mirror string, paths ...string) {
+	t.Helper()
+	for _, path := range paths {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(work, path)), 0o755); err != nil {
+			t.Fatalf("create parent for %s: %v", path, err)
+		}
+		mustWrite(t, filepath.Join(work, path), "base\n")
+	}
+	mustRun(t, work, "git", "add", "-A")
+	mustRun(t, work, "git", "commit", "-q", "-m", "add lockfiles")
+	if code := run([]string{"push", work}); code != 0 {
+		t.Fatalf("setup push exit %d", code)
+	}
+	for _, path := range paths {
+		mustWrite(t, filepath.Join(mirror, path), "mirror\n")
+	}
+	mustRun(t, mirror, "git", "add", "-A")
+	mustRun(t, mirror, "git", "commit", "-q", "-m", "mirror lockfiles")
+	for _, path := range paths {
+		mustWrite(t, filepath.Join(work, path), "work\n")
+	}
+	mustRun(t, work, "git", "add", "-A")
+	mustRun(t, work, "git", "commit", "-q", "-m", "work lockfiles")
+}
+
 func TestPushNoMergeOnDivergence(t *testing.T) {
 	work, mirror, _ := buildChain(t)
 	divergentClean(t, work, mirror)
