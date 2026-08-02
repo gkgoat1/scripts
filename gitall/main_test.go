@@ -167,6 +167,127 @@ func TestPushPullAllBranches(t *testing.T) {
 	}
 }
 
+func TestMultiBranchLeavesWorktreeUntouched(t *testing.T) {
+	work, mirror, upstream := buildChain(t)
+	base := currentBranchName(t, work)
+	baseHead := readHead(t, work)
+	baseFile := filepath.Join(work, "f.txt")
+	baseContent, err := os.ReadFile(baseFile)
+	if err != nil {
+		t.Fatalf("read base worktree file: %v", err)
+	}
+
+	mustRun(t, work, "git", "checkout", "-q", "-b", "feature")
+	mustWrite(t, filepath.Join(work, "feature.txt"), "work feature\n")
+	mustRun(t, work, "git", "add", "-A")
+	mustRun(t, work, "git", "commit", "-q", "-m", "work feature")
+	featureHead := readHead(t, work)
+	mustRun(t, work, "git", "checkout", "-q", base)
+
+	if code := run([]string{"push", work}); code != 0 {
+		t.Fatalf("gitall multi-branch push exit %d", code)
+	}
+	if got := currentBranchName(t, work); got != base {
+		t.Errorf("work left on %s, want %s", got, base)
+	}
+	if got := readHead(t, work); got != baseHead {
+		t.Errorf("base HEAD moved during feature-only push: %s -> %s", baseHead, got)
+	}
+	if got := readBranchHead(t, work, base); got != baseHead {
+		t.Errorf("base tip moved during feature-only push: %s -> %s", baseHead, got)
+	}
+	if got, err := os.ReadFile(baseFile); err != nil || string(got) != string(baseContent) {
+		t.Errorf("base worktree file changed: %q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(work, "feature.txt")); !os.IsNotExist(err) {
+		t.Errorf("feature.txt appeared in worktree while on %s (err=%v)", base, err)
+	}
+	if out, err := exec.Command("git", "-C", work, "status", "--porcelain").Output(); err != nil {
+		t.Fatal(err)
+	} else if got := strings.TrimSpace(string(out)); got != "" {
+		t.Errorf("work tree dirty after multi-branch push: %s", got)
+	}
+	for _, repo := range []string{mirror, upstream} {
+		if got := readBranchHead(t, repo, "feature"); got != featureHead {
+			t.Errorf("%s feature = %s, want %s", repo, got, featureHead)
+		}
+	}
+
+	mustRun(t, upstream, "git", "checkout", "-q", "feature")
+	mustWrite(t, filepath.Join(upstream, "feature.txt"), "upstream feature\n")
+	mustRun(t, upstream, "git", "commit", "-q", "-am", "upstream feature")
+	upstreamFeatureHead := readHead(t, upstream)
+	mustRun(t, upstream, "git", "checkout", "-q", base)
+
+	if code := run([]string{"pull", work}); code != 0 {
+		t.Fatalf("gitall multi-branch pull exit %d", code)
+	}
+	if got := currentBranchName(t, work); got != base {
+		t.Errorf("work left on %s after pull, want %s", got, base)
+	}
+	if got := readHead(t, work); got != baseHead {
+		t.Errorf("base HEAD moved during feature-only pull: %s -> %s", baseHead, got)
+	}
+	if got, err := os.ReadFile(baseFile); err != nil || string(got) != string(baseContent) {
+		t.Errorf("base worktree file changed after pull: %q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(work, "feature.txt")); !os.IsNotExist(err) {
+		t.Errorf("feature.txt appeared in worktree after pull (err=%v)", err)
+	}
+	if got := readBranchHead(t, work, "feature"); got != upstreamFeatureHead {
+		t.Errorf("work feature after pull = %s, want %s", got, upstreamFeatureHead)
+	}
+}
+
+func TestPushAllowMergeNonCurrentBranch(t *testing.T) {
+	work, mirror, upstream := buildChain(t)
+	base := currentBranchName(t, work)
+
+	mustRun(t, work, "git", "checkout", "-q", "-b", "feature")
+	mustWrite(t, filepath.Join(work, "shared.txt"), "base\n")
+	mustRun(t, work, "git", "add", "-A")
+	mustRun(t, work, "git", "commit", "-q", "-m", "feature base")
+	if code := run([]string{"push", work}); code != 0 {
+		t.Fatalf("setup push exit %d", code)
+	}
+
+	mustWrite(t, filepath.Join(mirror, "mirror.txt"), "mirror\n")
+	mustRun(t, mirror, "git", "checkout", "-q", "feature")
+	mustRun(t, mirror, "git", "add", "-A")
+	mustRun(t, mirror, "git", "commit", "-q", "-m", "mirror feature")
+	mustRun(t, mirror, "git", "checkout", "-q", base)
+
+	mustWrite(t, filepath.Join(work, "work.txt"), "work\n")
+	mustRun(t, work, "git", "add", "-A")
+	mustRun(t, work, "git", "commit", "-q", "-m", "work feature")
+	mustRun(t, work, "git", "checkout", "-q", base)
+	baseHead := readHead(t, work)
+
+	if code := run([]string{"-allow-merge", "push", work}); code != 0 {
+		t.Fatalf("gitall -allow-merge push exit %d", code)
+	}
+	if got := currentBranchName(t, work); got != base {
+		t.Errorf("work left on %s, want %s", got, base)
+	}
+	if got := readHead(t, work); got != baseHead {
+		t.Errorf("base HEAD moved while merging feature: %s -> %s", baseHead, got)
+	}
+	featureTip := readBranchHead(t, work, "feature")
+	if out, err := exec.Command("git", "-C", work, "rev-list", "--parents", "-n", "1", featureTip).Output(); err != nil {
+		t.Fatal(err)
+	} else if len(strings.Fields(string(out))) != 3 {
+		t.Errorf("feature tip is not a merge commit: %s", out)
+	}
+	if _, err := os.Stat(filepath.Join(work, "work.txt")); !os.IsNotExist(err) {
+		t.Errorf("work.txt from feature appeared in base worktree (err=%v)", err)
+	}
+	for _, repo := range []string{mirror, upstream} {
+		if got := readBranchHead(t, repo, "feature"); got != featureTip {
+			t.Errorf("%s feature = %s, want merged %s", repo, got, featureTip)
+		}
+	}
+}
+
 func TestSkipUnclean(t *testing.T) {
 	work, mirror, upstream := buildChain(t)
 
@@ -584,25 +705,29 @@ func TestMergeModeGating(t *testing.T) {
 			work, mirror, _ := buildChain(t)
 			divergentClean(t, work, mirror)
 			workHead := readHead(t, work)
+			branch := currentBranchName(t, work)
 
 			o := opts{mergeMode: c.mode}
-			updated, err := o.syncRemote(work, "origin", c.isLocal)
+			if err := o.git(work, "fetch", "origin"); err != nil {
+				t.Fatalf("fetch: %v", err)
+			}
+			updated, err := o.syncRemote(work, "origin", branch, c.isLocal)
 			if err != nil {
 				t.Fatalf("syncRemote: %v", err)
 			}
 			if c.want {
 				if !updated {
-					t.Fatal("expected merge, but HEAD did not move")
+					t.Fatal("expected merge, but branch tip did not move")
 				}
-				if got := readHead(t, work); got == workHead {
-					t.Fatal("work HEAD did not advance after merge")
+				if got := readBranchHead(t, work, branch); got == workHead {
+					t.Fatal("work branch tip did not advance after merge")
 				}
 			} else {
 				if updated {
-					t.Fatal("did not expect merge, but HEAD moved")
+					t.Fatal("did not expect merge, but branch tip moved")
 				}
-				if got := readHead(t, work); got != workHead {
-					t.Fatalf("work HEAD should be unchanged, got %s want %s", got, workHead)
+				if got := readBranchHead(t, work, branch); got != workHead {
+					t.Fatalf("work branch tip should be unchanged, got %s want %s", got, workHead)
 				}
 			}
 		})

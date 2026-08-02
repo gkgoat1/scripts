@@ -38,14 +38,16 @@ If no roots are given, `.` is used.
 `gitall` synchronizes every local branch, not just the currently checked-out
 branch. Before each branch is pushed, it is fetched and fast-forwarded (or
 merged when enabled) from the corresponding branch on each remote; each branch
-is then pushed explicitly. Pulls likewise fetch and pull every local branch.
+is then pushed explicitly. Pulls likewise fetch and update every local branch.
 Branches which do not yet exist on a remote are safely skipped while pulling
 and created while pushing.
 
-Repositories must still be clean unless `-m` is supplied. `gitall` temporarily
-checks out branches one at a time and restores the original branch (or detached
-`HEAD`) when finished, so commits are never accidentally merged, rebased, or
-pushed as a different branch.
+Repositories must still be clean unless `-m` is supplied. Non-current branches
+are updated with git ref/index plumbing (`update-ref`, temporary
+`GIT_INDEX_FILE`, `merge-tree` / `commit-tree`) so the working tree and `HEAD`
+are never switched away from the checked-out branch. When the checked-out
+branch's tip itself moves, `gitall` refreshes that worktree with
+`git checkout -f HEAD` as described below.
 
 `-all` remains available to push tags in addition to this default all-branch
 behavior.
@@ -84,12 +86,13 @@ gitall -allow-merge push ~/work              # shorthand for -allow-merge=pr
 
 The old boolean `-allow-merge` flag is retained as a shorthand for `-allow-merge=pr`, and `-pr` is retained as a deprecated alias for the same thing.
 
-## `checkout HEAD` after updates
+## `checkout -f HEAD` after updates
 
-Whenever `gitall` updates a repository—whether by merge, pull, or pushing into a
-local remote—it runs `git checkout HEAD` in that repository afterward. Working
-tree mismatches after a remote update are therefore reconciled automatically.
-Failures are logged but not fatal.
+Whenever `gitall` moves the tip of the currently checked-out branch—whether by
+merge, pull, or pushing into a local remote—it runs `git checkout -f HEAD` in
+that repository afterward so the index and working tree match the new tip.
+Updates to other branches do not touch the working tree. Failures are logged
+but not fatal.
 
 ## Per-repo concurrency guard
 
