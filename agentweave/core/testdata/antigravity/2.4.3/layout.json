@@ -1,0 +1,6 @@
+{
+  "fixture_version": "2.4.3",
+  "persistent_store": "User/workspaceStorage/<workspace-id>/chatSessions/<session-id>.jsonl",
+  "record_shape": "JSONL message/session records with optional workspace.json mapping",
+  "never_read": ["Cache", "Code Cache", "GPUCache", "blob_storage"]
+}
