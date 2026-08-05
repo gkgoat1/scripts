@@ -24,17 +24,12 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsup src/index.ts src/client.ts --format esm --dts --clean",
+    "build": "tsup",
     "test": "tsc --noEmit && npm run build && node --test test/*.test.mjs"
   },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "typebox": "^1.2.8"
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.82.0 <0.84.0"
-  },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "typebox": "^1.2.8",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3"
   }
