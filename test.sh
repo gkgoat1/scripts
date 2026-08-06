@@ -1,4 +1,5 @@
 #!/bin/sh
 set -eu
-cd "$(dirname "$0")"
-make test
+ROOT="$(CDPATH= cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+exec make test

@@ -1,2 +1,5 @@
 #!/bin/sh
-go run "$(dirname "$0")/pulse" "$@"
+set -eu
+ROOT="$(CDPATH= cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+exec go run ./pulse "$@"

@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(CDPATH= cd "$(dirname "$0")" && pwd)"
 . "${ROOT}/installer/launchagent.sh"
 
 DEST="${HOME}/.local/bin/agentcommit"
