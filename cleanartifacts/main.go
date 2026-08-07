@@ -121,14 +121,21 @@ func (c candidate) shouldPreserve() bool {
 	return isPiOwnedNodeModules(c.path)
 }
 
+// cacheDirTag is the file Cargo writes at the root of every target
+// directory it manages (the Cache Directory Tagging Specification,
+// https://bford.info/cachedir/). A directory that merely happens to be
+// named "target" — e.g. a source tree containing crates named
+// os-target-* — won't have it, so its presence is what distinguishes a
+// real Cargo build-output directory from a coincidentally-named one that
+// must not be deleted.
+const cacheDirTag = "CACHEDIR.TAG"
+
 // hasExpectedStructure gates -targets-only removal: the artifact must look
 // like a real build/dependency tree, not a coincidentally-named directory.
 func (c candidate) hasExpectedStructure() bool {
 	switch c.name {
 	case "target":
-		// Cargo/Rust convention: a directory named target at a package root.
-		// No stronger marker exists; accept the directory itself.
-		return true
+		return fileExists(filepath.Join(c.path, cacheDirTag))
 	case "node_modules":
 		parent := filepath.Dir(c.path)
 		if fileExists(filepath.Join(parent, "package.json")) {

@@ -201,9 +201,10 @@ func TestCleanTargetsOnlyPreservesPiOwned(t *testing.T) {
 	nm := filepath.Join(pkgDir, "node_modules", "dep")
 	testutil.MkdirAll(t, nm)
 	testutil.WriteFile(t, filepath.Join(pkgDir, "package.json"), `{"name":"pkg"}`)
-	// target is always cleaned.
-	target := filepath.Join(root, "pkg", "target", "out")
-	testutil.MkdirAll(t, target)
+	// A real Cargo target (has CACHEDIR.TAG) is always cleaned.
+	target := filepath.Join(root, "pkg", "target")
+	testutil.MkdirAll(t, filepath.Join(target, "out"))
+	testutil.WriteFile(t, filepath.Join(target, cacheDirTag), "Signature: 8a477f597d28d172789f06886806bc55\n")
 
 	var buf bytes.Buffer
 	if err := cleanTargetsOnly(root, defaultOpts(&buf, &buf)); err != nil {
@@ -214,6 +215,24 @@ func TestCleanTargetsOnlyPreservesPiOwned(t *testing.T) {
 	}
 	if testutil.PathExists(target) {
 		t.Error("target still exists")
+	}
+}
+
+func TestCleanTargetsOnlySparesSourceDirNamedTarget(t *testing.T) {
+	root := t.TempDir()
+	// A source tree that happens to live under a directory named "target"
+	// (e.g. crates/target/os-target-core), with no CACHEDIR.TAG: this must
+	// never be deleted by the structural gate.
+	crateFile := filepath.Join(root, "crates", "target", "os-target-core", "Cargo.toml")
+	testutil.MkdirAll(t, filepath.Dir(crateFile))
+	testutil.WriteFile(t, crateFile, "[package]\nname = \"os-target-core\"\n")
+
+	var buf bytes.Buffer
+	if err := cleanTargetsOnly(root, defaultOpts(&buf, &buf)); err != nil {
+		t.Fatal(err)
+	}
+	if !testutil.PathExists(crateFile) {
+		t.Error("source dir named target was removed")
 	}
 }
 
@@ -260,8 +279,9 @@ func TestRemovePathsListsEach(t *testing.T) {
 
 func TestDaemonSingleTick(t *testing.T) {
 	root := t.TempDir()
-	target := filepath.Join(root, "proj", "target", "out")
-	testutil.MkdirAll(t, target)
+	target := filepath.Join(root, "proj", "target")
+	testutil.MkdirAll(t, filepath.Join(target, "out"))
+	testutil.WriteFile(t, filepath.Join(target, cacheDirTag), "Signature: 8a477f597d28d172789f06886806bc55\n")
 
 	var out, errOut bytes.Buffer
 	opts := defaultOpts(&out, &errOut)
@@ -323,10 +343,19 @@ func TestCandidateHasExpectedStructure(t *testing.T) {
 		t.Error("bare node_modules should fail structure gate")
 	}
 
-	// target is always structurally valid.
+	// target with a CACHEDIR.TAG is a real Cargo build dir.
 	tgt := filepath.Join(root, "target")
 	testutil.MkdirAll(t, tgt)
+	testutil.WriteFile(t, filepath.Join(tgt, cacheDirTag), "Signature: 8a477f597d28d172789f06886806bc55\n")
 	if !(candidate{path: tgt, name: "target"}).hasExpectedStructure() {
-		t.Error("target should pass structure gate")
+		t.Error("target with CACHEDIR.TAG should pass structure gate")
+	}
+
+	// A bare directory named target with no CACHEDIR.TAG is not verifiably
+	// a Cargo build dir (it could be a source tree) and must fail the gate.
+	bareTgt := filepath.Join(root, "bare-target")
+	testutil.MkdirAll(t, bareTgt)
+	if (candidate{path: bareTgt, name: "target"}).hasExpectedStructure() {
+		t.Error("bare target without CACHEDIR.TAG should fail structure gate")
 	}
 }

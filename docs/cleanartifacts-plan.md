@@ -100,8 +100,14 @@ from the running executable when unset):
 A new flag that restricts cleaning to `target` and `node_modules` **and**
 validates each has the expected structure before deleting:
 
-- `target/` — must be a directory (Rust/Cargo convention). Always cleaned;
-  no Pi conflict.
+- `target/` — must contain Cargo's `CACHEDIR.TAG` marker (the [Cache
+  Directory Tagging Specification](https://bford.info/cachedir/), which
+  Cargo writes at the root of every target directory it manages). This
+  distinguishes a real build-output directory from one that merely happens
+  to be named `target`, e.g. a source tree containing crates named
+  `os-target-*` — `cleanTargetsOnly` (and thus the daemon) previously
+  treated *any* directory named `target` as cleanable regardless of
+  contents and deleted one such source tree. No Pi conflict either way.
 - `node_modules/` — must be a directory whose **parent** has `package.json`
   **or** which itself contains a `.package-lock.json` (npm installs leave
   this marker). This is the "expected structure" gate: a bare directory
