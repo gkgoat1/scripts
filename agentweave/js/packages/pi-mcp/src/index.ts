@@ -21,17 +21,18 @@ export default function agentWeaveExtension(pi: ExtensionAPI): void {
         agents: Type.Optional(Type.Array(Type.String())),
         kinds: Type.Optional(Type.Array(Type.String())),
         include_global: Type.Optional(Type.Boolean()),
+        include_user_workflows: Type.Optional(Type.Boolean()),
       })),
       limit: Type.Optional(Type.Number({ minimum: 1, maximum: 50 })),
     }),
-    execute: async (_id: string, params: { query: string; filters?: { agents?: string[]; kinds?: string[]; include_global?: boolean }; limit?: number }, _signal: AbortSignal, _update: unknown, ctx: ExtensionContext) => toolCall(ctx, pi, "agentweave_search", { workspace: ctx.cwd, ...params }),
+    execute: async (_id: string, params: { query: string; filters?: { agents?: string[]; kinds?: string[]; include_global?: boolean; include_user_workflows?: boolean }; limit?: number }, _signal: AbortSignal, _update: unknown, ctx: ExtensionContext) => toolCall(ctx, pi, "agentweave_search", { workspace: ctx.cwd, ...params }),
   });
   pi.registerTool({
     name: "agentweave_read",
     label: "AgentWeave Read",
     description: "Read cited AgentWeave evidence chunks from the current workspace.",
-    parameters: Type.Object({ refs: Type.Array(Type.String(), { minItems: 1, maxItems: 30 }), max_bytes: Type.Optional(Type.Number({ minimum: 1, maximum: 24576 })) }),
-    execute: async (_id: string, params: { refs: string[]; max_bytes?: number }, _signal: AbortSignal, _update: unknown, ctx: ExtensionContext) => toolCall(ctx, pi, "agentweave_read", { workspace: ctx.cwd, ...params }),
+    parameters: Type.Object({ refs: Type.Array(Type.String(), { minItems: 1, maxItems: 30 }), max_bytes: Type.Optional(Type.Number({ minimum: 1, maximum: 24576 })), include_user_workflows: Type.Optional(Type.Boolean()) }),
+    execute: async (_id: string, params: { refs: string[]; max_bytes?: number; include_user_workflows?: boolean }, _signal: AbortSignal, _update: unknown, ctx: ExtensionContext) => toolCall(ctx, pi, "agentweave_read", { workspace: ctx.cwd, ...params }),
   });
   pi.registerTool({
     name: "agentweave_synthesize",

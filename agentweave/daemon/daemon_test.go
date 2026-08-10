@@ -28,11 +28,12 @@ func TestDaemonRoundTripEnforcesScopedRead(t *testing.T) {
 	if _, err := index.Sync(context.Background(), []core.Artifact{{Agent: core.AgentCodex, Kind: core.KindConversation, Workspace: workspace, SourcePath: source, Text: "cross-agent evidence"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	workdir, err := os.Getwd()
+	socketDir, err := os.MkdirTemp("", "agentweave-daemon-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	socket := filepath.Join(workdir, ".aw-test-"+core.StableID(dir)+".sock")
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socket := filepath.Join(socketDir, "agentweave.sock")
 	server, err := Listen(&Service{Index: index}, socket)
 	if err != nil {
 		if errors.Is(err, syscall.EPERM) {

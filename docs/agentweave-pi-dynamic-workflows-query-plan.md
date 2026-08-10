@@ -35,7 +35,9 @@ tests before relying on it.
   saved workflow files.
 - Persisted run state can contain scripts, args, prompts, results, histories,
   logs, session IDs, and operational data. Full subagent Pi sessions may also
-  be persisted separately when the package option is enabled.
+  be persisted separately when the package option is enabled; they extend the
+  main Pi transcript and must be indexed with equivalent provenance and
+  workspace isolation.
 - Existing source replacement is keyed by `source_path`: all artifacts derived
   from one path are replaced together. Therefore one user workflow source must
   not be duplicated as normal workspace artifacts without an identity-model
@@ -43,33 +45,39 @@ tests before relying on it.
 
 ### Goal
 
-Enable an AgentWeave user, from an exact workspace, to discover and cite the
-saved workflows applicable to that workspace, for example:
+Enable an AgentWeave user, from an exact workspace, to discover, cite, and
+retrieve both saved workflows applicable to that workspace and the workflow-run
+transcript material that extends that workspace’s Pi conversations.
 
 - “Find a workflow for adversarial review.”
 - “What parameters and phases does our `code-review` workflow have?”
 - “Is there a project workflow that verifies a change?”
 
-The first release indexes **saved workflow definitions**. It may expose their
-script as bounded, citeable evidence, but retrieval must favor the name,
-description, parameters, and declared metadata over boilerplate script text.
+The first release indexes **saved workflow definitions and persisted workflow
+runs**. Definition retrieval may expose scripts as bounded, citeable evidence,
+but must favor name, description, parameters, and declared metadata over
+boilerplate script text. Run retrieval treats persisted subagent sessions,
+histories, results, and logs as transcript evidence, using the same chunking,
+citation, workspace-scoping, and retention semantics as the main Pi transcript.
 It must retain scope, source, freshness, and shadowing provenance.
 
 ### Non-goals and hard boundaries
 
 - Do not execute, resolve for execution, schedule, import, evaluate, or
-  otherwise run workflow code. Querying a workflow is not approval to run it.
+  otherwise run workflow code. Querying a workflow or its transcript is not
+  approval to run it.
 - Do not reverse a project-key hash, infer a workspace from a slug, repository
   remote, basename, script content, or nearby working directory.
 - Do not crawl arbitrary projects or arbitrary directories under `~/.pi`.
   Discovery must be limited to a versioned verified layout plus an explicit
   workspace attribution mechanism.
-- Do not index workflow runs in the first release. In particular, do not index
-  prompts, histories, raw results, logs, arguments, or optional full subagent
-  transcripts by default.
-- Do not add embeddings, remote services, daemon-owned model credentials, or a
-  hidden sampling path. Existing evidence and explicit sample semantics remain
-  unchanged.
+- Index manifest-proven workflow runs. Runs are transcript extensions, not a
+  separate sensitive-data class: index persisted prompts, histories, results,
+  logs, arguments, and optional subagent sessions under the same local evidence,
+  scoping, retention, purge, and access rules as the main Pi conversation adapter.
+- Do not execute, resolve for execution, schedule, import, evaluate, or
+  otherwise run workflow code. Querying a workflow or its transcript is not
+  approval to run it.
 - Do not make user-scoped or built-in definitions visible in ordinary
   workspace searches merely because they are locally readable.
 - Do not treat indexed script text as trusted instructions. It remains
@@ -125,11 +133,13 @@ Add these first-class identifiers in `agentweave/core/model.go`:
 ```go
 AgentPiWorkflows Agent = "pi_workflows"
 KindWorkflow     Kind  = "workflow"
-// KindWorkflowRun Kind = "workflow_run" // reserved for later opt-in phase
+KindWorkflowRun  Kind  = "workflow_run"
 ```
 
 Register the adapter in `DefaultAdapters()` in `agentweave/core/adapters.go`.
-The adapter is read-only and may only enumerate:
+The adapter is read-only and may only enumerate the manifest, saved-definition,
+and persisted-run paths explicitly confirmed in the pi-dynamic-workflows
+layout, for example:
 
 ```text
 ~/.pi/workflows/projects/*/agentweave-manifest.json
@@ -144,9 +154,16 @@ symlink escape.
 
 ### 3. Definition model and index model
 
-Keep the normal `Artifact` as the citeable, chunked evidence carrier and add a
-workflow-specific relational projection. This avoids parsing prose back out of
-FTS while preserving current generic search/read/dossier behavior.
+Keep the normal `Artifact` as the citeable, chunked evidence carrier and add
+workflow-specific relational projections. Run records are normalized into
+transcript-like artifacts/chunks and retain manifest-proven canonical workspace,
+run ID, workflow name where available, record timestamp, source path/record,
+and parent relationships to definitions and sessions. Avoid duplicate chunks
+when the same underlying Pi session JSONL is already indexed by `PiAdapter`:
+use a shared source identity (canonical path plus record identity/content
+fingerprint), or delegate those session files to the Pi transcript parser.
+Run-specific state with no transcript analogue is indexed as `workflow_run`
+evidence.
 
 Add `workflow_definitions` in `agentweave/core/index.go` migrations:
 
@@ -167,6 +184,21 @@ CREATE TABLE workflow_definitions (
   visibility TEXT NOT NULL DEFAULT 'workspace',
   indexability TEXT NOT NULL DEFAULT 'full'
 );
+CREATE TABLE workflow_runs (
+  artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL,
+  workflow_name TEXT NOT NULL DEFAULT '',
+  workspace TEXT NOT NULL,
+  session_id TEXT NOT NULL DEFAULT '',
+  record_type TEXT NOT NULL,
+  parent_definition_id TEXT NOT NULL DEFAULT '',
+  started_at_ms INTEGER NOT NULL DEFAULT 0,
+  finished_at_ms INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT '',
+  source_fingerprint TEXT NOT NULL
+);
+CREATE INDEX workflow_runs_lookup_idx
+  ON workflow_runs(workspace, workflow_name, run_id, started_at_ms);
 CREATE INDEX workflow_definitions_lookup_idx
   ON workflow_definitions(declared_workspace, name, precedence);
 CREATE INDEX workflow_definitions_name_idx ON workflow_definitions(name);
@@ -222,10 +254,13 @@ stale checkout on disk.
 
 ### Parsing and failure handling
 
-A saved definition requires string `name`, `description`, and `script`; it may
-have an object `parameters`. Reject NUL, slash, traversal-like, or otherwise
-unsafe names under the package's confirmed saved-workflow name policy. Ignore
-unknown future fields unless a documented schema says they are safe metadata.
+A persisted run must be parsed using pi-dynamic-workflows’ confirmed schema and
+emitted in its natural event/history order. Persisted session transcripts use
+the same normalization and chunking policy as `PiAdapter`; the workflow adapter
+adds run provenance rather than a lossy summary. The adapter may enumerate only
+run files at exact names/locations under a manifest-proven project root, ignores
+temporaries, never follows symlinks outside that root, and retains last-known-
+good evidence across transient malformed writes just as it does definitions.
 
 Read primary JSON only. On a missing or transiently unreadable primary, retry
 once after a small bounded delay. Never index `.bak` as an independent record.
@@ -264,11 +299,13 @@ workspace scope, apply a documented shadowed penalty, and retain current FTS
 and recency behavior. Scores and returned reasons must be reproducible; no
 model reranking is permitted.
 
-A dedicated `agentweave_find_workflows` convenience tool is phase 2, after the
-base generic search is proven. It accepts workspace, query, optional user and
-built-in inclusion, structured parameter/capability filters, and bounded
-limit. It returns workflow metadata, scope, shadowing, freshness, and evidence
-refs. It never invokes a workflow.
+Add `KindWorkflowRun` and bounded run filters (`workflow_name`, `run_id`,
+`session_id`, plus time/status where appropriate) without changing generic
+transcript search defaults. Generic workspace searches include manifest-proven
+workflow-run transcript artifacts just as they include main Pi transcripts.
+A dedicated `agentweave_find_workflows` convenience tool remains phase 2; it
+may provide run-aware diagnostics but is not required for run evidence to be
+searchable and readable.
 
 ## API, tool, and configuration changes
 
@@ -284,11 +321,10 @@ refs. It never invokes a workflow.
    `last_success_at`, and `stale_since` fields, and add meaningful states such
    as `metadata_incomplete` and `stale` without changing old callers' handling.
 5. **Config:** add narrow explicit settings in `core.Config`, for example
-   `workflow_indexing` (default enabled for safe saved definitions once the
-   adapter ships) and `index_workflow_runs` (default false). Document that
-   disabling workflow indexing stops discovery but does not imply secure
-   erasure of previously indexed data; provide an explicit purge/migration
-   operation if required. Existing config files remain valid.
+   `workflow_indexing` (default enabled for definitions and manifest-proven
+   runs once the adapter ships). It must use the same retention and purge
+   configuration that governs Pi transcript indexing; do not add a separate
+   `index_workflow_runs` opt-in switch. Existing config files remain valid.
 
 ## Provenance, privacy, and trust
 
@@ -303,9 +339,10 @@ refs. It never invokes a workflow.
   evidence expansion: make it configurable, honor deny globs where applicable,
   bound indexed/read text, and document opt-out. Run ingestion stays off by
   default because its sensitivity is substantially higher.
-- With `persistAgentSessions=true`, run data could duplicate Pi conversation
-  transcripts already indexed by `PiAdapter`. Do not add run summaries until
-  deduplication and disclosure policy are specified.
+- With `persistAgentSessions=true`, run data can duplicate Pi conversation
+  transcripts already indexed by `PiAdapter`. Deduplicate shared persisted
+  session sources rather than suppressing workflow material; relation metadata
+  must preserve that a transcript was produced by a workflow run.
 - Retrieval never bypasses workspace authorization because a caller already
   has an `aw:` ref. Reads must enforce the same workspace/user-global decision
   as searches and must never fall back to direct filesystem reads.
@@ -339,12 +376,18 @@ refs. It never invokes a workflow.
 - Targets: `agentweave/core/adapters_test.go`, `core/index_test.go`,
   `daemon/daemon_test.go`, and a new `core/workflows_test.go`.
 
-### Phase 1 — safe saved-definition retrieval
+### Phase 1 — saved definitions and workflow-run transcript retrieval
 
-- Add types, `PiWorkflowsAdapter`, manifest reader/parser, strict path checks,
-  status diagnostics, and adapter registration.
-- Add schema migration, transactional metadata writes/deletes, scoped search
-  filtering, deterministic workflow result ordering, and stale preservation.
+- Add types including `KindWorkflowRun`, `PiWorkflowsAdapter`, manifest
+  reader/parser, strict path checks, run-state/session parsers or delegation to
+  Pi transcript parsing, status diagnostics, adapter registration, and
+  cross-adapter deduplication identity.
+- Add schema migrations, transactional definition/run metadata writes/deletes,
+  scoped generic search filtering, deterministic workflow result ordering, and
+  stale preservation.
+- Index every manifest-proven persisted run record with normal transcript-like
+  chunks; preserve run/session/definition parent links and use the same
+  retention/purge semantics as Pi conversations.
 - Add `include_user_workflows` through daemon transport, MCP schema/handler,
   and Pi extension TypeBox schema.
 - Targets: `agentweave/core/model.go`, `core/config.go`, `core/adapters.go`,
@@ -356,33 +399,25 @@ refs. It never invokes a workflow.
   and existing atomic persistence helper to write the manifest. This change is
   separately versioned and must be optional/compatible.
 
-### Phase 2 — richer discovery and built-ins
+### Phase 3 — richer discovery and built-ins
 
 - Publish bridge-reported versioned built-in descriptors and index them as
   metadata-only global artifacts.
-- Add `agentweave_find_workflows`, structured parameter/capability filters,
-  explicit `include_builtin_workflows`, returned provenance/reasons, and
-  shadowing diagnostics.
+- Add `agentweave_find_workflows`, structured parameter/capability and
+  run-status filters, explicit `include_builtin_workflows`, returned
+  provenance/reasons, and shadowing diagnostics.
 - Targets: `core/index.go`, `mcpserver/server.go`, Pi bridge source/tests, and
   the external package's built-in registry/extension integration.
-
-### Phase 3 — opt-in run summaries (separate approval)
-
-- Require `index_workflow_runs: true` plus a documented retention setting.
-- Add `KindWorkflowRun`; index an allowlisted bounded projection only
-  (name/status/phases/timestamps/token usage/error code and redacted preview).
-  Bind every run to manifest-proven workspace and session ID.
-- Do not include prompts, full results, histories, logs, arguments, or session
-  transcripts without a further independently approved policy. Define
-  deduplication against Pi session ingestion and run-file pruning semantics.
 
 ## Test plan and validation
 
 Use real temporary files, directories, symlinks where supported, SQLite, and
 socket paths rather than mocks for boundary behavior. Include at least:
 
-- valid project and user indexing; stable IDs, content fingerprint updates,
-  chunks, citations, and transactional replacement;
+- valid project and user definitions plus manifest-proven workflow runs;
+  stable IDs, content fingerprint updates, transcript chunking/order,
+  citations, parent links, transactional replacement, and no duplicate evidence
+  for a shared Pi session source;
 - exact workspace isolation, including sibling worktrees and canonical-path
   variants; user definitions absent without explicit inclusion;
 - project/user/built-in shadowing order and diagnostic variant behavior;
@@ -418,13 +453,13 @@ indexed counts, invalid/skipped count, last attempt/success, stale time, and
 safe diagnostic reasons without printing workflow scripts. Logs must not emit
 scripts, args, prompts, or results.
 
-Roll out behind safe-definition configuration with run indexing permanently off
-by default. First deploy the external manifest writer, verify owner-only files
-and manifests for several real workspaces, then enable the AgentWeave adapter.
-Use status and fixture/manual checks to verify exact-workspace discovery before
-advertising the Pi search filter. Provide a documented purge/reindex path for
-users who enabled indexing and later opt out. Track malformed-layout and
-manifest-validation diagnostics, not query contents.
+Roll out behind workflow indexing with the same local-data disclosure and
+retention defaults as Pi transcript indexing. First deploy the external manifest
+writer, verify owner-only files and manifests for several real workspaces, then
+enable the AgentWeave adapter. Verify exact-workspace run and definition
+discovery, cross-adapter deduplication, and purge/reindex behavior before
+advertising the Pi search filter. Track malformed-layout and manifest-validation
+diagnostics, not query contents.
 
 ## Acceptance criteria
 
@@ -440,8 +475,11 @@ manifest-validation diagnostics, not query contents.
    client-model-free; no retrieval action executes workflow code.
 6. Existing AgentWeave clients/configurations/indexes continue to work, and all
    Go race tests plus AgentWeave JS build/tests pass.
-7. Run prompts/results/histories/transcripts remain outside the index unless a
-   later explicit opt-in phase implements its separate criteria.
+7. Manifest-proven workflow runs—including their persisted prompts, histories,
+   results, logs, arguments, and subagent transcript material—are
+   searchable/readable as extensions of the main transcript, have stable
+   citeable evidence and run provenance, and do not duplicate already indexed
+   Pi session records.
 
 ## Open questions and risks
 
@@ -464,6 +502,10 @@ manifest-validation diagnostics, not query contents.
 - **Built-in contract:** descriptor args/capabilities and package version must
   come from a stable external API; generated source is intentionally not a
   compatible index contract.
-- **Run summaries:** define redaction, TTL, deletion behavior, session
-  visibility, and Pi-transcript deduplication before phase 3. This is a
-  separate privacy review, not a small extension of definition indexing.
+- **Run parsing and identity:** confirm the persisted run/session schemas,
+  atomic-write lifecycle, and how a shared Pi session is identified so the
+  adapter can preserve all transcript material while producing one canonical
+  evidence source rather than duplicates.
+- **Retention parity:** document precisely which existing Pi transcript
+  retention/purge settings apply to workflow-run paths, and ensure a transcript
+  purge removes derived workflow-run metadata and chunks consistently.

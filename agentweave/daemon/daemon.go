@@ -135,9 +135,10 @@ func (s *Server) serveConnection(ctx context.Context, connection net.Conn) {
 }
 
 type readParams struct {
-	Workspace string   `json:"workspace"`
-	Refs      []string `json:"refs"`
-	MaxBytes  int      `json:"max_bytes,omitempty"`
+	Workspace            string   `json:"workspace"`
+	Refs                 []string `json:"refs"`
+	MaxBytes             int      `json:"max_bytes,omitempty"`
+	IncludeUserWorkflows bool     `json:"include_user_workflows,omitempty"`
 }
 
 func (s *Server) handle(ctx context.Context, request Request) Response {
@@ -165,7 +166,7 @@ func (s *Server) handle(ctx context.Context, request Request) Response {
 		if !decode(&params) {
 			return response
 		}
-		result, err = s.service.Index.ReadScoped(ctx, params.Workspace, params.Refs, params.MaxBytes, false)
+		result, err = s.service.Index.ReadScopedWithUser(ctx, params.Workspace, params.Refs, params.MaxBytes, false, params.IncludeUserWorkflows)
 	case "dossier":
 		var params core.SynthesisRequest
 		if !decode(&params) {
@@ -229,8 +230,12 @@ func (c Client) Search(ctx context.Context, request core.SearchRequest) ([]core.
 }
 
 func (c Client) Read(ctx context.Context, workspace string, refs []string, maxBytes int) ([]core.SearchResult, error) {
+	return c.ReadWithUser(ctx, workspace, refs, maxBytes, false)
+}
+
+func (c Client) ReadWithUser(ctx context.Context, workspace string, refs []string, maxBytes int, includeUserWorkflows bool) ([]core.SearchResult, error) {
 	var result []core.SearchResult
-	err := c.Call(ctx, "read", readParams{Workspace: workspace, Refs: refs, MaxBytes: maxBytes}, &result)
+	err := c.Call(ctx, "read", readParams{Workspace: workspace, Refs: refs, MaxBytes: maxBytes, IncludeUserWorkflows: includeUserWorkflows}, &result)
 	return result, err
 }
 

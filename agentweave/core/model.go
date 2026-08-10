@@ -18,6 +18,7 @@ const (
 	AgentCursor      Agent = "cursor"
 	AgentCodex       Agent = "codex"
 	AgentPi          Agent = "pi"
+	AgentPiWorkflows Agent = "pi_workflows"
 	AgentAntigravity Agent = "antigravity"
 	AgentFilesystem  Agent = "filesystem"
 )
@@ -30,23 +31,27 @@ const (
 	KindPlan         Kind = "plan"
 	KindTask         Kind = "task"
 	KindArtifact     Kind = "artifact"
+	KindWorkflow     Kind = "workflow"
+	KindWorkflowRun  Kind = "workflow_run"
 )
 
 // Artifact is the loss-minimized representation of one local source item.
 // Text is retained locally so reads and citations remain stable after a source
 // application is closed or its internal layout changes.
 type Artifact struct {
-	ID           string    `json:"id"`
-	Agent        Agent     `json:"agent"`
-	Kind         Kind      `json:"kind"`
-	Workspace    string    `json:"workspace,omitempty"`
-	Title        string    `json:"title"`
-	SourcePath   string    `json:"source_path"`
-	SourceRecord string    `json:"source_record,omitempty"`
-	ParentID     string    `json:"parent_id,omitempty"`
-	CreatedAt    time.Time `json:"created_at,omitempty"`
-	UpdatedAt    time.Time `json:"updated_at,omitempty"`
-	Text         string    `json:"-"`
+	ID                 string              `json:"id"`
+	Agent              Agent               `json:"agent"`
+	Kind               Kind                `json:"kind"`
+	Workspace          string              `json:"workspace,omitempty"`
+	Title              string              `json:"title"`
+	SourcePath         string              `json:"source_path"`
+	SourceRecord       string              `json:"source_record,omitempty"`
+	ParentID           string              `json:"parent_id,omitempty"`
+	CreatedAt          time.Time           `json:"created_at,omitempty"`
+	UpdatedAt          time.Time           `json:"updated_at,omitempty"`
+	Text               string              `json:"-"`
+	WorkflowDefinition *WorkflowDefinition `json:"-"`
+	WorkflowRun        *WorkflowRun        `json:"-"`
 }
 
 // Normalize makes fields safe for use as a local index key.
@@ -126,12 +131,40 @@ type Chunk struct {
 // SearchRequest limits searches to one explicit registered workspace unless
 // IncludeGlobal is deliberately set by a caller.
 type SearchRequest struct {
-	Workspace     string  `json:"workspace"`
-	Query         string  `json:"query"`
-	Agents        []Agent `json:"agents,omitempty"`
-	Kinds         []Kind  `json:"kinds,omitempty"`
-	Limit         int     `json:"limit,omitempty"`
-	IncludeGlobal bool    `json:"include_global,omitempty"`
+	Workspace            string  `json:"workspace"`
+	Query                string  `json:"query"`
+	Agents               []Agent `json:"agents,omitempty"`
+	Kinds                []Kind  `json:"kinds,omitempty"`
+	Limit                int     `json:"limit,omitempty"`
+	IncludeGlobal        bool    `json:"include_global,omitempty"`
+	IncludeUserWorkflows bool    `json:"include_user_workflows,omitempty"`
+}
+
+type WorkflowDefinition struct {
+	Name            string
+	Scope           string
+	ProjectKey      string
+	Precedence      int
+	SavedAt         time.Time
+	ScriptHash      string
+	ParametersJSON  string
+	MetaJSON        string
+	MetaParseStatus string
+	PackageVersion  string
+	Visibility      string
+	Indexability    string
+}
+
+type WorkflowRun struct {
+	RunID              string
+	WorkflowName       string
+	SessionID          string
+	Status             string
+	StartedAt          time.Time
+	FinishedAt         time.Time
+	SourceFingerprint  string
+	RecordType         string
+	ParentDefinitionID string
 }
 
 // SearchResult carries evidence, never an unsupported conclusion.

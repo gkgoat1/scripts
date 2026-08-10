@@ -25,7 +25,7 @@ func Open(path string) (*Index, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create AgentWeave data directory: %w", err)
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)")
 	if err != nil {
 		return nil, err
 	}
@@ -105,8 +105,44 @@ CREATE TABLE IF NOT EXISTS sources (
   synced_at_ms INTEGER NOT NULL,
   artifact_count INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS workflow_definitions (
+ artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+ name TEXT NOT NULL, scope TEXT NOT NULL, declared_workspace TEXT NOT NULL DEFAULT '',
+ project_key TEXT NOT NULL DEFAULT '', precedence INTEGER NOT NULL, saved_at_ms INTEGER NOT NULL DEFAULT 0,
+ script_hash TEXT NOT NULL, parameters_json TEXT NOT NULL DEFAULT '[]',
+ meta_json TEXT NOT NULL DEFAULT '{}', meta_parse_status TEXT NOT NULL DEFAULT 'unavailable',
+ package_version TEXT NOT NULL DEFAULT '', visibility TEXT NOT NULL DEFAULT 'workspace', indexability TEXT NOT NULL DEFAULT 'full'
+);
+CREATE INDEX IF NOT EXISTS workflow_definitions_lookup_idx ON workflow_definitions(declared_workspace, name, precedence);
+CREATE INDEX IF NOT EXISTS workflow_definitions_name_idx ON workflow_definitions(name);
+CREATE TABLE IF NOT EXISTS workflow_runs (
+ artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+ run_id TEXT NOT NULL, workflow_name TEXT NOT NULL DEFAULT '', workspace TEXT NOT NULL,
+ session_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT '', started_at_ms INTEGER NOT NULL DEFAULT 0,
+ finished_at_ms INTEGER NOT NULL DEFAULT 0, source_fingerprint TEXT NOT NULL DEFAULT '',
+ record_type TEXT NOT NULL DEFAULT 'state', parent_definition_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS workflow_runs_lookup_idx ON workflow_runs(workspace, workflow_name, run_id, started_at_ms);
 `)
-	return err
+	if err != nil {
+		return err
+	}
+	// ALTER ADD is intentionally idempotent: duplicate-column errors mean an
+	// existing index has already crossed this migration boundary.
+	for _, statement := range []string{
+		"ALTER TABLE workflow_definitions ADD COLUMN meta_json TEXT NOT NULL DEFAULT '{}'",
+		"ALTER TABLE workflow_definitions ADD COLUMN meta_parse_status TEXT NOT NULL DEFAULT 'unavailable'",
+		"ALTER TABLE workflow_definitions ADD COLUMN package_version TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE workflow_definitions ADD COLUMN visibility TEXT NOT NULL DEFAULT 'workspace'",
+		"ALTER TABLE workflow_definitions ADD COLUMN indexability TEXT NOT NULL DEFAULT 'full'",
+		"ALTER TABLE workflow_runs ADD COLUMN record_type TEXT NOT NULL DEFAULT 'state'",
+		"ALTER TABLE workflow_runs ADD COLUMN parent_definition_id TEXT NOT NULL DEFAULT ''",
+	} {
+		if _, e := i.db.Exec(statement); e != nil && !strings.Contains(e.Error(), "duplicate column") {
+			return e
+		}
+	}
+	return nil
 }
 
 // Sync applies a complete scan. Files whose bytes have not changed are left
@@ -207,6 +243,18 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, artifact.ID, artifact.Agent, artifact.
 		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO revisions(artifact_id, revision_hash, source_path, captured_at_ms, content_hash) VALUES (?, ?, ?, ?, ?)`, artifact.ID, revisionHash, artifact.SourcePath, time.Now().UnixMilli(), contentHash); err != nil {
 			return err
 		}
+		if artifact.WorkflowDefinition != nil {
+			w := artifact.WorkflowDefinition
+			if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_definitions(artifact_id, name, scope, declared_workspace, project_key, precedence, saved_at_ms, script_hash, parameters_json, meta_json, meta_parse_status, package_version, visibility, indexability) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, artifact.ID, w.Name, w.Scope, artifact.Workspace, w.ProjectKey, w.Precedence, w.SavedAt.UnixMilli(), w.ScriptHash, w.ParametersJSON, w.MetaJSON, w.MetaParseStatus, w.PackageVersion, w.Visibility, w.Indexability); err != nil {
+				return err
+			}
+		}
+		if artifact.WorkflowRun != nil {
+			w := artifact.WorkflowRun
+			if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_runs(artifact_id, run_id, workflow_name, workspace, session_id, status, started_at_ms, finished_at_ms, source_fingerprint, record_type, parent_definition_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, artifact.ID, w.RunID, w.WorkflowName, artifact.Workspace, w.SessionID, w.Status, w.StartedAt.UnixMilli(), w.FinishedAt.UnixMilli(), w.SourceFingerprint, w.RecordType, w.ParentDefinitionID); err != nil {
+				return err
+			}
+		}
 		if artifact.ParentID != "" {
 			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO agent_relations(child_artifact_id, parent_artifact_id, relation) VALUES (?, ?, 'spawned_from')`, artifact.ID, artifact.ParentID); err != nil {
 				return err
@@ -290,7 +338,7 @@ func (i *Index) pruneMissingSources(ctx context.Context) error {
 // callers cannot accidentally create FTS operators.
 func (i *Index) Search(ctx context.Context, request SearchRequest) ([]SearchResult, error) {
 	workspace := CanonicalWorkspace(request.Workspace)
-	if workspace == "" && !request.IncludeGlobal {
+	if workspace == "" && (!request.IncludeGlobal || request.IncludeUserWorkflows) {
 		return nil, fmt.Errorf("workspace is required for project-scoped search")
 	}
 	query := ftsQuery(request.Query)
@@ -304,7 +352,10 @@ func (i *Index) Search(ctx context.Context, request SearchRequest) ([]SearchResu
 	where := []string{"chunks_fts MATCH ?"}
 	args := []any{query}
 	if request.IncludeGlobal {
-		where = append(where, "(a.workspace = ? OR a.workspace = '')")
+		where = append(where, "(a.workspace = ? OR (a.workspace = '' AND (a.agent != 'pi_workflows' OR a.kind != 'workflow' OR ?)))")
+		args = append(args, workspace, request.IncludeUserWorkflows)
+	} else if request.IncludeUserWorkflows {
+		where = append(where, "(a.workspace = ? OR (a.workspace = '' AND a.agent = 'pi_workflows' AND a.kind = 'workflow'))")
 		args = append(args, workspace)
 	} else {
 		where = append(where, "a.workspace = ?")
@@ -381,7 +432,7 @@ func deterministicWeight(agent Agent, updated time.Time) float64 {
 
 // ReadScoped enforces the same workspace boundary as Search. Evidence refs are
 // opaque identifiers, but they are not treated as authorization tokens.
-func (i *Index) ReadScoped(ctx context.Context, workspace string, refs []string, maxBytes int, includeGlobal bool) ([]SearchResult, error) {
+func (i *Index) ReadScopedWithUser(ctx context.Context, workspace string, refs []string, maxBytes int, includeGlobal, includeUserWorkflows bool) ([]SearchResult, error) {
 	if len(refs) == 0 {
 		return nil, fmt.Errorf("at least one evidence reference is required")
 	}
@@ -398,11 +449,15 @@ FROM chunks c JOIN artifacts a ON a.id = c.artifact_id WHERE c.ref IN (` + place
 		args[n] = ref
 	}
 	workspace = CanonicalWorkspace(workspace)
-	if workspace == "" && !includeGlobal {
+	if workspace == "" && (!includeGlobal || includeUserWorkflows) {
 		return nil, fmt.Errorf("workspace is required for project-scoped reads")
 	}
 	if includeGlobal {
-		statement += ` AND (a.workspace = ? OR a.workspace = '')`
+		statement += ` AND (a.workspace = ? OR (a.workspace = '' AND (a.agent != 'pi_workflows' OR a.kind != 'workflow' OR ?)))`
+		args = append(args, workspace, includeUserWorkflows)
+	} else if includeUserWorkflows {
+		statement += ` AND (a.workspace = ? OR (a.workspace = '' AND a.agent = 'pi_workflows' AND a.kind = 'workflow'))`
+		args = append(args, workspace)
 	} else {
 		statement += ` AND a.workspace = ?`
 	}
@@ -433,6 +488,11 @@ FROM chunks c JOIN artifacts a ON a.id = c.artifact_id WHERE c.ref IN (` + place
 		}
 	}
 	return results, rows.Err()
+}
+
+// ReadScoped is the compatibility form without user-workflow visibility.
+func (i *Index) ReadScoped(ctx context.Context, workspace string, refs []string, maxBytes int, includeGlobal bool) ([]SearchResult, error) {
+	return i.ReadScopedWithUser(ctx, workspace, refs, maxBytes, includeGlobal, false)
 }
 
 // Read is retained for trusted local maintenance callers. MCP-facing code must

@@ -55,7 +55,8 @@ func OpenService(paths Paths) (*core.Index, *daemon.Service, core.Config, error)
 	if err != nil {
 		return nil, nil, config, err
 	}
-	service := &daemon.Service{Index: index, Options: core.ScanOptions{Home: paths.Home, ArtifactRoots: config.ArtifactRoots, DenyGlobs: config.DenyGlobs}}
+	enabled := config.WorkflowsEnabled()
+	service := &daemon.Service{Index: index, Options: core.ScanOptions{Home: paths.Home, ArtifactRoots: config.ArtifactRoots, DenyGlobs: config.DenyGlobs, WorkflowIndexing: &enabled}}
 	return index, service, config, nil
 }
 

@@ -21,14 +21,15 @@ type Adapter interface {
 
 // ScanOptions is intentionally local-only. Home can be overridden for tests.
 type ScanOptions struct {
-	Home          string
-	ArtifactRoots []string
-	DenyGlobs     []string
+	Home             string
+	ArtifactRoots    []string
+	DenyGlobs        []string
+	WorkflowIndexing *bool
 }
 
 func DefaultAdapters() []Adapter {
 	return []Adapter{
-		ClaudeAdapter{}, CursorAdapter{}, CodexAdapter{}, PiAdapter{}, AntigravityAdapter{}, FilesystemAdapter{},
+		ClaudeAdapter{}, CursorAdapter{}, CodexAdapter{}, PiAdapter{}, PiWorkflowsAdapter{}, AntigravityAdapter{}, FilesystemAdapter{},
 	}
 }
 
@@ -38,6 +39,9 @@ func ScanAll(ctx context.Context, options ScanOptions) ([]Artifact, []SourceStat
 	var artifacts []Artifact
 	var statuses []SourceStatus
 	for _, adapter := range DefaultAdapters() {
+		if adapter.Name() == AgentPiWorkflows && options.WorkflowIndexing != nil && !*options.WorkflowIndexing {
+			continue
+		}
 		found, state, err := adapter.Scan(ctx, options)
 		artifacts = append(artifacts, found...)
 		statuses = append(statuses, state...)

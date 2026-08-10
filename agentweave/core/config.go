@@ -14,6 +14,8 @@ type Config struct {
 	ArtifactRoots []string `json:"artifact_roots,omitempty"`
 	DenyGlobs     []string `json:"deny_globs,omitempty"`
 	PollSeconds   int      `json:"poll_seconds,omitempty"`
+	// WorkflowIndexing defaults to enabled. Set false to stop discovering definitions and runs; it does not purge existing evidence.
+	WorkflowIndexing *bool `json:"workflow_indexing,omitempty"`
 }
 
 func DefaultDataDir(home string) string {
@@ -50,3 +52,6 @@ func LoadConfig(path string) (Config, error) {
 	}
 	return config, nil
 }
+
+// WorkflowsEnabled is deliberately default-on once the adapter is available.
+func (c Config) WorkflowsEnabled() bool { return c.WorkflowIndexing == nil || *c.WorkflowIndexing }

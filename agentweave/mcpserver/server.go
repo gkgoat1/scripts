@@ -28,9 +28,9 @@ var _ Backend = daemon.Client{}
 func New(backend Backend, version string) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "agentweave", Version: version}, nil)
 	server.AddTool(tool("agentweave_search", "Search local cross-agent evidence in one workspace.", `{
-"type":"object","required":["workspace","query"],"properties":{"workspace":{"type":"string"},"query":{"type":"string"},"filters":{"type":"object","properties":{"agents":{"type":"array","items":{"type":"string"}},"kinds":{"type":"array","items":{"type":"string"}},"include_global":{"type":"boolean"}}},"limit":{"type":"integer","minimum":1,"maximum":50}}}`), searchHandler(backend))
+"type":"object","required":["workspace","query"],"properties":{"workspace":{"type":"string"},"query":{"type":"string"},"filters":{"type":"object","properties":{"agents":{"type":"array","items":{"type":"string"}},"kinds":{"type":"array","items":{"type":"string"}},"include_global":{"type":"boolean"},"include_user_workflows":{"type":"boolean"}}},"limit":{"type":"integer","minimum":1,"maximum":50}}}`), searchHandler(backend))
 	server.AddTool(tool("agentweave_read", "Read bounded evidence chunks from one workspace.", `{
-"type":"object","required":["workspace","refs"],"properties":{"workspace":{"type":"string"},"refs":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":30},"max_bytes":{"type":"integer","minimum":1,"maximum":24576}}}`), readHandler(backend))
+"type":"object","required":["workspace","refs"],"properties":{"workspace":{"type":"string"},"refs":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":30},"max_bytes":{"type":"integer","minimum":1,"maximum":24576},"include_user_workflows":{"type":"boolean"}}}`), readHandler(backend))
 	server.AddTool(tool("agentweave_synthesize", "Return an evidence dossier, or explicitly request one parent-client sampling completion grounded in it.", `{
 "type":"object","required":["workspace","question","generation"],"properties":{"workspace":{"type":"string"},"question":{"type":"string"},"selection":{"type":"array","items":{"type":"string"},"maxItems":30},"detail":{"type":"string"},"generation":{"type":"string","enum":["evidence","sample"]}}}`), synthesizeHandler(backend))
 	server.AddTool(tool("agentweave_status", "Report local AgentWeave source health and freshness without returning source text.", `{"type":"object","properties":{}}`), statusHandler(backend))
@@ -47,16 +47,17 @@ func searchHandler(backend Backend) mcp.ToolHandler {
 			Workspace string `json:"workspace"`
 			Query     string `json:"query"`
 			Filters   struct {
-				Agents        []core.Agent `json:"agents"`
-				Kinds         []core.Kind  `json:"kinds"`
-				IncludeGlobal bool         `json:"include_global"`
+				Agents               []core.Agent `json:"agents"`
+				Kinds                []core.Kind  `json:"kinds"`
+				IncludeGlobal        bool         `json:"include_global"`
+				IncludeUserWorkflows bool         `json:"include_user_workflows"`
 			} `json:"filters"`
 			Limit int `json:"limit"`
 		}
 		if err := decode(req, &input); err != nil {
 			return toolError(err), nil
 		}
-		result, err := backend.Search(ctx, core.SearchRequest{Workspace: input.Workspace, Query: input.Query, Agents: input.Filters.Agents, Kinds: input.Filters.Kinds, Limit: input.Limit, IncludeGlobal: input.Filters.IncludeGlobal})
+		result, err := backend.Search(ctx, core.SearchRequest{Workspace: input.Workspace, Query: input.Query, Agents: input.Filters.Agents, Kinds: input.Filters.Kinds, Limit: input.Limit, IncludeGlobal: input.Filters.IncludeGlobal, IncludeUserWorkflows: input.Filters.IncludeUserWorkflows})
 		if err != nil {
 			return toolError(err), nil
 		}
@@ -67,14 +68,25 @@ func searchHandler(backend Backend) mcp.ToolHandler {
 func readHandler(backend Backend) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var input struct {
-			Workspace string   `json:"workspace"`
-			Refs      []string `json:"refs"`
-			MaxBytes  int      `json:"max_bytes"`
+			Workspace            string   `json:"workspace"`
+			Refs                 []string `json:"refs"`
+			MaxBytes             int      `json:"max_bytes"`
+			IncludeUserWorkflows bool     `json:"include_user_workflows"`
 		}
 		if err := decode(req, &input); err != nil {
 			return toolError(err), nil
 		}
-		result, err := backend.Read(ctx, input.Workspace, input.Refs, input.MaxBytes)
+		var result []core.SearchResult
+		var err error
+		if scoped, ok := backend.(interface {
+			ReadWithUser(context.Context, string, []string, int, bool) ([]core.SearchResult, error)
+		}); ok {
+			result, err = scoped.ReadWithUser(ctx, input.Workspace, input.Refs, input.MaxBytes, input.IncludeUserWorkflows)
+		} else if input.IncludeUserWorkflows {
+			err = fmt.Errorf("backend does not support user workflow reads")
+		} else {
+			result, err = backend.Read(ctx, input.Workspace, input.Refs, input.MaxBytes)
+		}
 		if err != nil {
 			return toolError(err), nil
 		}
